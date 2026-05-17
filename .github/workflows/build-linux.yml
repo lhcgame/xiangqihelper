@@ -1,0 +1,126 @@
+name: Build Linux app
+
+on:
+  workflow_dispatch:
+
+env:
+  PYTHON_VERSION: "3.11"
+  PIKAFISH_URL: "https://github.com/official-pikafish/Pikafish/releases/download/Pikafish-2026-01-02/Pikafish.2026-01-02.7z"
+  RELEASE_DIR: "Linux"
+  ARTIFACT_NAME: "XiangqiHelper-linux-x64"
+  DATA_SEP: ":"
+
+jobs:
+  build-linux:
+    name: Build Linux x64
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install system packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            p7zip-full \
+            libegl1 \
+            libgl1 \
+            libxcb-cursor0 \
+            libxkbcommon-x11-0
+
+      - name: Install Python packages
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt pyinstaller
+
+      - name: Download Pikafish release
+        run: |
+          python - <<'PY'
+          import os
+          import urllib.request
+
+          url = os.environ["PIKAFISH_URL"]
+          print(f"Downloading {url}")
+          urllib.request.urlretrieve(url, "pikafish.7z")
+          PY
+
+      - name: Extract Pikafish release
+        run: 7z x pikafish.7z -opikafish-release -y
+
+      - name: Bundle Linux engines and NNUE
+        run: |
+          python - <<'PY'
+          import os
+          import shutil
+          import stat
+          from pathlib import Path
+
+          release_dir = Path("pikafish-release")
+          platform_dir_name = os.environ["RELEASE_DIR"]
+          platform_dir = release_dir / platform_dir_name
+
+          files = [p for p in release_dir.rglob("*") if p.is_file()]
+          if not files:
+              raise SystemExit("No files found after extracting Pikafish release")
+
+          nnues = [p for p in files if p.suffix.lower() == ".nnue"]
+          if not nnues:
+              raise SystemExit("No .nnue file found in Pikafish release")
+          nnue = max(nnues, key=lambda p: p.stat().st_size)
+          shutil.copy2(nnue, "pikafish.nnue")
+          print(f"Selected NNUE: {nnue}")
+
+          if not platform_dir.is_dir():
+              raise SystemExit(f"Release folder not found: {platform_dir}")
+
+          dest_dir = Path("engines") / platform_dir_name
+          dest_dir.mkdir(parents=True, exist_ok=True)
+          copied = []
+          for engine in sorted(platform_dir.glob("pikafish*")):
+              if engine.is_file():
+                  dest = dest_dir / engine.name
+                  shutil.copy2(engine, dest)
+                  mode = dest.stat().st_mode
+                  dest.chmod(mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+                  copied.append(dest)
+
+          if not copied:
+              raise SystemExit(f"No engine binaries found in {platform_dir}")
+
+          print("Bundled engines:")
+          for path in copied:
+              print(f"  {path}")
+          PY
+
+      - name: Build app
+        run: |
+          python -m PyInstaller \
+            --noconfirm \
+            --clean \
+            --onedir \
+            --windowed \
+            --name XiangqiHelper \
+            --add-data "config.json${DATA_SEP}." \
+            --add-data "templates${DATA_SEP}templates" \
+            --add-data "engines${DATA_SEP}engines" \
+            --add-data "pikafish.nnue${DATA_SEP}." \
+            main.py
+
+      - name: Fix engine permissions
+        run: find dist -path '*engines/pikafish*' -type f -exec chmod +x {} \;
+
+      - name: Upload Linux artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.ARTIFACT_NAME }}
+          path: dist/**
+          if-no-files-found: error
