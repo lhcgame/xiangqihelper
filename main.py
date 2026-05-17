@@ -936,29 +936,41 @@ def launch_gui():
             self.signals.calibration_done.connect(self.on_calibration_done)
             self.signals.recognition_done.connect(self.on_recognition_done)
 
-            self.setWindowTitle("Xiangqi Helper")
-            self.setMinimumWidth(420)
+            self.setWindowTitle("象棋屏幕助手")
+            self.setMinimumWidth(500)
 
-            self.title = QLabel("Xiangqi Helper")
+            self.title = QLabel("象棋屏幕助手")
             self.title.setAlignment(Qt.AlignCenter)
             self.title.setStyleSheet("font-size: 20px; font-weight: 600;")
 
-            self.status = QLabel("Stopped")
+            self.status = QLabel("已停止")
             self.status.setAlignment(Qt.AlignCenter)
 
-            self.start_button = QPushButton("Start")
-            self.reload_button = QPushButton("Reload")
-            self.calibrate_button = QPushButton("Calibrate")
-            self.exit_button = QPushButton("Exit")
+            self.start_button = QPushButton("开始")
+            self.reload_button = QPushButton("重新读取")
+            self.calibrate_button = QPushButton("校准棋盘")
+            self.exit_button = QPushButton("退出")
+            self.start_button.setToolTip("开始识别棋盘；运行中再次点击会停止。")
+            self.reload_button.setToolTip("重新读取 config.json 和校准图片，并重新计算当前局面。")
+            self.calibrate_button.setToolTip("重新选择棋盘位置，并保存棋子识别图片。")
+            self.exit_button.setToolTip("关闭程序，并停止 Pikafish 引擎。")
 
             self.min_time_spin = self.make_seconds_spin(0.1, 60.0)
             self.max_time_spin = self.make_seconds_spin(0.1, 60.0)
-            self.turn_indicator_checkbox = QCheckBox("Use turn avatar")
-            self.recognize_turn_button = QPushButton("Recognize Turn")
-            self.auto_next_checkbox = QCheckBox("Auto start next game")
-            self.active_next_scan_checkbox = QCheckBox("Active next screen scan")
-            self.recognize_next_button = QPushButton("Recognize Next")
-            self.save_settings_button = QPushButton("Save Settings")
+            self.turn_indicator_checkbox = QCheckBox("用头像绿色圈判断轮到我")
+            self.recognize_turn_button = QPushButton("识别头像位置")
+            self.auto_next_checkbox = QCheckBox("自动开始下一局")
+            self.active_next_scan_checkbox = QCheckBox("主动寻找下一局按钮")
+            self.recognize_next_button = QPushButton("识别下一局按钮")
+            self.save_settings_button = QPushButton("保存设置")
+            self.min_time_spin.setToolTip("引擎最少思考几秒。")
+            self.max_time_spin.setToolTip("引擎最多思考几秒。")
+            self.turn_indicator_checkbox.setToolTip("开启后，只有看到你头像旁的绿色倒计时圈，程序才会走棋。")
+            self.recognize_turn_button.setToolTip("框选你头像旁的绿色倒计时圈，用来判断是不是轮到你。")
+            self.auto_next_checkbox.setToolTip("一局结束后，如果识别到下一局按钮，就自动点击进入下一局。")
+            self.active_next_scan_checkbox.setToolTip("运行时持续扫描屏幕，尽快发现下一局按钮。")
+            self.recognize_next_button.setToolTip("在结算界面点击下一局按钮中心，让程序记住按钮样子。")
+            self.save_settings_button.setToolTip("保存上面的设置到 config.json。")
 
             self.start_button.clicked.connect(self.toggle_helper)
             self.reload_button.clicked.connect(self.reload_helper)
@@ -976,17 +988,17 @@ def launch_gui():
 
             move_time_row = QHBoxLayout()
             move_time_row.addWidget(self.min_time_spin)
-            move_time_row.addWidget(QLabel("to"))
+            move_time_row.addWidget(QLabel("到"))
             move_time_row.addWidget(self.max_time_spin)
 
-            settings = QGroupBox("Config")
+            settings = QGroupBox("常用设置")
             settings_form = QFormLayout()
-            settings_form.addRow("Move time", move_time_row)
+            settings_form.addRow("思考时间", move_time_row)
             settings_form.addRow(self.turn_indicator_checkbox)
-            settings_form.addRow("Turn avatar", self.recognize_turn_button)
+            settings_form.addRow("轮到我识别", self.recognize_turn_button)
             settings_form.addRow(self.auto_next_checkbox)
             settings_form.addRow(self.active_next_scan_checkbox)
-            settings_form.addRow("Next button", self.recognize_next_button)
+            settings_form.addRow("下一局识别", self.recognize_next_button)
             settings_form.addRow("", self.save_settings_button)
             settings.setLayout(settings_form)
 
@@ -1003,7 +1015,7 @@ def launch_gui():
             spin.setRange(minimum, maximum)
             spin.setDecimals(1)
             spin.setSingleStep(0.5)
-            spin.setSuffix(" sec")
+            spin.setSuffix(" 秒")
             return spin
 
         def config_float(self, config, key, default):
@@ -1052,13 +1064,13 @@ def launch_gui():
                     "next_game_fullscreen_scan": self.active_next_scan_checkbox.isChecked(),
                 })
             except Exception as e:
-                self.set_status(f"Settings error: {e}")
+                self.set_status(f"设置保存失败：{e}")
                 return
             if self.app_worker is not None:
                 self.app_worker.request_reload()
-                self.set_status("Settings saved. Reloading...")
+                self.set_status("设置已保存，正在重新读取...")
             else:
-                self.set_status("Settings saved")
+                self.set_status("设置已保存")
 
         def set_status(self, text):
             self.status.setText(text)
@@ -1074,25 +1086,25 @@ def launch_gui():
 
         def start_helper(self):
             if self.worker_thread and self.worker_thread.is_alive():
-                self.set_status("Already running")
+                self.set_status("已经在运行")
                 return
             if not calibration_exists():
-                self.set_status("config.json missing. Click Calibrate first.")
-                self.start_button.setText("Start")
+                self.set_status("缺少 config.json，请先点击“校准棋盘”。")
+                self.start_button.setText("开始")
                 self.start_button.setEnabled(True)
                 return
 
-            self.start_button.setText("Stop")
-            self.set_status("Starting...")
+            self.start_button.setText("停止")
+            self.set_status("正在启动...")
             self.worker_thread = threading.Thread(target=self.run_worker, daemon=True)
             self.worker_thread.start()
 
         def stop_helper(self):
             if self.app_worker is None:
-                self.set_status("Still starting...")
+                self.set_status("还在启动中...")
                 return
             self.start_button.setEnabled(False)
-            self.set_status("Stopping...")
+            self.set_status("正在停止...")
             self.app_worker.stop()
 
         def run_worker(self):
@@ -1102,37 +1114,37 @@ def launch_gui():
                     self.app_worker.stop()
                     self.app_worker.eng.quit()
                     return
-                self.signals.status.emit("Running")
+                self.signals.status.emit("正在运行")
                 self.app_worker.run(use_keyboard=False)
             except Exception as e:
-                self.signals.status.emit(f"Error: {e}")
+                self.signals.status.emit(f"错误：{e}")
             finally:
                 self.app_worker = None
                 self.signals.stopped.emit()
 
         def reload_helper(self):
             if self.app_worker is None:
-                self.set_status("Start helper first")
+                self.set_status("请先点击“开始”")
                 return
             self.app_worker.request_reload()
-            self.set_status("Reloading...")
+            self.set_status("正在重新读取...")
 
         def calibrate_helper(self):
             if self.calibrate_thread and self.calibrate_thread.is_alive():
-                self.set_status("Calibration already running")
+                self.set_status("校准窗口已经打开")
                 return
             self.calibrate_button.setEnabled(False)
-            self.set_status("Opening calibration...")
+            self.set_status("正在打开校准窗口...")
             self.calibrate_thread = threading.Thread(target=self.run_calibration, daemon=True)
             self.calibrate_thread.start()
 
         def recognize_next_game(self):
             if self.recognize_thread and self.recognize_thread.is_alive():
-                self.set_status("Recognition already running")
+                self.set_status("识别窗口已经打开")
                 return
             self.recognize_turn_button.setEnabled(False)
             self.recognize_next_button.setEnabled(False)
-            self.set_status("Opening next button recognition...")
+            self.set_status("正在打开下一局按钮识别窗口...")
             self.recognize_thread = threading.Thread(
                 target=self.run_next_game_recognition,
                 daemon=True,
@@ -1141,11 +1153,11 @@ def launch_gui():
 
         def recognize_turn_indicator(self):
             if self.recognize_thread and self.recognize_thread.is_alive():
-                self.set_status("Recognition already running")
+                self.set_status("识别窗口已经打开")
                 return
             self.recognize_turn_button.setEnabled(False)
             self.recognize_next_button.setEnabled(False)
-            self.set_status("Opening turn avatar recognition...")
+            self.set_status("正在打开头像识别窗口...")
             self.recognize_thread = threading.Thread(
                 target=self.run_turn_indicator_recognition,
                 daemon=True,
@@ -1161,11 +1173,11 @@ def launch_gui():
 
                 result = subprocess.run(_calibration_command(), cwd=_app_dir(), check=False)
                 if result.returncode == 0:
-                    self.signals.status.emit("Calibration saved")
+                    self.signals.status.emit("校准已保存")
                 else:
-                    self.signals.status.emit(f"Calibration exited: {result.returncode}")
+                    self.signals.status.emit(f"校准窗口已关闭：{result.returncode}")
             except Exception as e:
-                self.signals.status.emit(f"Calibration error: {e}")
+                self.signals.status.emit(f"校准失败：{e}")
             finally:
                 self.signals.calibration_done.emit()
 
@@ -1182,11 +1194,11 @@ def launch_gui():
                     check=False,
                 )
                 if result.returncode == 0:
-                    self.signals.status.emit("Next button saved")
+                    self.signals.status.emit("下一局按钮已保存")
                 else:
-                    self.signals.status.emit(f"Recognition exited: {result.returncode}")
+                    self.signals.status.emit(f"识别窗口已关闭：{result.returncode}")
             except Exception as e:
-                self.signals.status.emit(f"Recognition error: {e}")
+                self.signals.status.emit(f"识别失败：{e}")
             finally:
                 self.signals.recognition_done.emit()
 
@@ -1203,11 +1215,11 @@ def launch_gui():
                     check=False,
                 )
                 if result.returncode == 0:
-                    self.signals.status.emit("Turn avatar saved")
+                    self.signals.status.emit("头像位置已保存")
                 else:
-                    self.signals.status.emit(f"Recognition exited: {result.returncode}")
+                    self.signals.status.emit(f"识别窗口已关闭：{result.returncode}")
             except Exception as e:
-                self.signals.status.emit(f"Recognition error: {e}")
+                self.signals.status.emit(f"识别失败：{e}")
             finally:
                 self.signals.recognition_done.emit()
 
@@ -1222,9 +1234,9 @@ def launch_gui():
 
         def on_stopped(self):
             self.start_button.setEnabled(True)
-            self.start_button.setText("Start")
-            if not self.status.text().startswith("Error:"):
-                self.set_status("Stopped")
+            self.start_button.setText("开始")
+            if not self.status.text().startswith("错误："):
+                self.set_status("已停止")
 
         def closeEvent(self, event):
             self.closing = True

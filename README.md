@@ -1,153 +1,257 @@
-# Pikafish Screen Helper
+# 象棋屏幕助手使用说明
 
-A small Python helper for Xiangqi. It watches your screen, reads the board with
-calibrated piece templates, sends the position to Pikafish, and prints the best
-move. It can also click the move for you if auto move is enabled.
+这是一个给中国象棋对局用的小工具。它会看你电脑屏幕上的棋盘，识别当前局面，然后让 Pikafish 引擎计算推荐走法。
 
-## What You Need
+如果开启自动走棋，它还可以帮你在棋盘上点击那一步；如果不想让它自动点，也可以只看它给出的走法。
 
-- Python 3
-- Pikafish and `pikafish.nnue`
-- A Xiangqi board visible on your primary monitor
+## 先看这里
 
-The app looks for engines in this order:
+使用前请准备好：
 
-- `engines/Windows/` on Windows
-- `engines/Linux/` on Linux
-- `engines/MacOS/` on macOS
-- `./pikafish.exe` on Windows, or `./pikafish` on Linux/macOS
+- 电脑上已经安装 Python 3。
+- 棋盘画面能正常显示在电脑屏幕上。
+- 本文件夹里有 `pikafish.exe` 和 `pikafish.nnue`。
 
-It picks the best engine binary for the client CPU when several Pikafish builds
-are in the platform folder.
+如果你只是普通 Windows 用户，通常不用管 Pikafish 放在哪里，因为本文件夹已经带了几个 `pikafish-xxx.exe` 文件。
 
-On macOS, give your terminal app Screen Recording permission. If you use auto
-move, also give it Accessibility permission.
+## 第一次使用
 
-On Linux, use an X11 session for auto move. If mouse control is not available,
-set `"auto_move": false` and the helper can still print moves.
+第一次用需要做两件事：
 
-## Install
+1. 安装需要的 Python 组件。
+2. 校准棋盘位置和棋子图片。
 
-```bash
-python3 -m pip install -r requirements.txt
-```
+### 第 1 步：打开命令窗口
 
-## Calibrate
+在本文件夹空白处按住 `Shift`，然后点鼠标右键，选择“在终端中打开”或“在 PowerShell 中打开”。
 
-Calibrate once for the board style you are using.
+如果你已经打开了命令窗口，请确认它的位置是在这个项目文件夹里。
 
-1. Open your Xiangqi board.
-2. Put the board in the standard starting position.
-3. Run:
+### 第 2 步：安装组件
+
+在命令窗口里输入：
 
 ```bash
-python3 calibrate.py
+python -m pip install -r requirements.txt
 ```
 
-4. Click the top-left grid intersection.
-5. Click the bottom-right grid intersection.
-6. Press Enter when the green grid preview lines up.
+如果上面的命令提示找不到 `python`，可以试试：
 
-Calibration saves:
+```bash
+py -m pip install -r requirements.txt
+```
+
+这个步骤只需要做一次。
+
+### 第 3 步：打开你的象棋棋盘
+
+先打开你要使用的象棋网站、软件或对局界面。
+
+请把棋盘调整到一个固定大小，最好不要太小。校准完成以后，尽量不要再改变网页缩放、棋盘皮肤、窗口大小或显示器位置。
+
+### 第 4 步：校准棋盘
+
+在命令窗口里输入：
+
+```bash
+python calibrate.py
+```
+
+如果不行，试试：
+
+```bash
+py calibrate.py
+```
+
+然后按提示操作：
+
+1. 点击棋盘左上角的交叉点。
+2. 点击棋盘右下角的交叉点。
+3. 看到绿色线条和棋盘格子对齐后，按 `Enter`。
+
+注意：要点“棋盘线的交叉点”，不是点棋子的中心。
+
+校准成功后，会生成或更新这些文件：
 
 - `config.json`
 - `templates/ref_board.png`
-- one template image for each piece in `templates/`
+- `templates/` 里面的棋子图片
 
-Recalibrate if you change websites, board themes, zoom level, or window size.
+以后如果换了网站、棋盘皮肤、网页缩放、窗口大小，或者把棋盘移到别的显示器上，请重新校准一次。
 
-For a second monitor, set `"screen_monitor": 2` in `config.json` before
-calibrating. Use `0` to capture the whole desktop.
+## 平时怎么打开
 
-## Run
-
-```bash
-python3 main.py
-```
-
-This opens a small control window.
-
-- Start / Stop: begin or stop watching the board
-- Reload: reload calibration/settings and recalculate
-- Calibrate: stop the helper and open calibration
-- Config: set timing, recognize the next-game button, and enable auto next game
-- Exit: stop the helper and close Pikafish
-
-If Start says `config.json missing`, click Calibrate first. The calibration
-window creates `config.json` for that app folder.
-
-The helper now uses the turn avatar as its trigger. When your green turn ring is
-active, it reads the current board, generates FEN, asks Pikafish for the best
-move, clicks that move, then waits until your next turn.
-
-For the old terminal-only mode, run:
+校准好以后，在命令窗口里输入：
 
 ```bash
-python3 main.py --cli
+python main.py
 ```
 
-## Auto Move
+如果不行，试试：
 
-Auto move is controlled in `config.json`.
+```bash
+py main.py
+```
 
-The GUI can save the common timing, turn, and next-game settings:
+打开后会出现一个小控制窗口。
 
-- Move time: search for a random time from the first number to the second number
-- Recognize Turn: select the rectangle around your avatar green countdown ring.
-- Use turn avatar: when that green ring is active on a stable board, search and
-  auto move once, then wait for the ring to go away before moving again.
-- Recognize Next: on the game-over screen, click the center of the Next Game
-  button and press Enter. This saves `templates/next_game_button.png`.
-- Auto start next game: when the saved button is visible, click it once and wait
-  for the new starting position.
-- Active next screen scan: while running, scan the current screen for the saved
-  next-game button and click it as soon as it appears.
+## 界面按钮说明
 
-To only print moves and never click:
+- `开始 / 停止`：开始或停止识别棋盘。
+- `重新读取`：重新读取设置，并重新计算当前局面。
+- `校准棋盘`：重新选择棋盘位置，并保存棋子识别图片。
+- `退出`：关闭工具和 Pikafish 引擎。
+- `保存设置`：保存下方常用设置。
+- `识别头像位置`：框选你头像旁边的绿色倒计时圈，用来判断是不是轮到你。
+- `识别下一局按钮`：在结算界面记录“下一局”按钮的位置和样子。
+
+如果点 `开始` 时提示缺少 `config.json`，说明还没有校准，请先点 `校准棋盘`。
+
+## 推荐使用方式
+
+推荐先这样用：
+
+1. 打开象棋对局。
+2. 运行 `python main.py`。
+3. 点 `开始`。
+4. 先观察工具能不能正确识别棋盘和推荐走法。
+5. 确认没问题后，再考虑开启自动走棋。
+
+这样更稳，也更容易发现是不是棋盘位置、缩放或皮肤不合适。
+
+## 自动走棋
+
+自动走棋由 `config.json` 里的设置控制，常用选项可以在主界面的“常用设置”里修改。
+
+如果只想看推荐走法，不想让工具帮你点击，把 `config.json` 里的这一项改成：
 
 ```json
 "auto_move": false
 ```
 
-To let the helper click moves:
+如果想让工具自动点击走法，改成：
 
 ```json
 "auto_move": true
 ```
 
-If clicks land too high or too low, adjust:
+如果发现点击的位置偏上或偏下，可以调整：
 
 ```json
 "auto_move_click_offset_y": -10
 ```
 
-Negative values click higher. Positive values click lower.
+数字越小，点击位置越往上；数字越大，点击位置越往下。
 
-## Files
+## 轮到我走时再自动动
 
-- `main.py`: runs the helper
-- `calibrate.py`: creates board and piece templates
-- `vision.py`: reads the board from the screen
-- `engine.py`: starts Pikafish and asks for moves
-- `app_paths.py`: finds files in source and packaged builds
-- `xiangqi_core.py`: validates board states and detects moves
-- `config.json`: calibration and auto-move settings
-- `templates/`: saved board and piece images
+这个工具可以通过你的头像绿色倒计时圈判断是不是轮到你走。
 
-## Troubleshooting
+在主界面里可以设置：
 
-If calibration is bad, run `python3 calibrate.py` again and click the grid
-intersections, not the piece centers.
+- `识别头像位置`：框选你的头像绿色倒计时区域。
+- `用头像绿色圈判断轮到我`：只有看到绿色倒计时圈时才开始计算和走棋。
 
-If the engine does not start on Linux/macOS, make sure `pikafish` is executable
-and the NNUE file exists:
+这样可以减少工具在对方回合误操作的可能。
+
+## 自动开始下一局
+
+如果你想让工具在一局结束后自动点“下一局”，可以在主界面里设置：
+
+- `识别下一局按钮`：在结算界面点击“下一局”按钮中心，然后按 `Enter`。
+- `自动开始下一局`：识别到下一局按钮后自动点击。
+- `主动寻找下一局按钮`：运行时主动寻找下一局按钮。
+
+不需要这个功能的话，可以保持关闭。
+
+## 常见问题
+
+### 识别不准怎么办？
+
+重新运行：
 
 ```bash
-ls -l pikafish pikafish.nnue
+python calibrate.py
 ```
 
-On Windows, use `pikafish.exe` or put the downloaded `.exe` files in
-`engines/Windows/`.
+校准时一定要点击棋盘线交叉点，不要点棋子。
 
-If the helper cannot see or click the board on macOS, check Screen Recording and
-Accessibility permissions for your terminal app.
+### 换了棋盘皮肤还能用吗？
+
+通常需要重新校准。因为不同皮肤的棋子图片不一样，工具需要重新学习当前画面。
+
+### 改了网页缩放还能用吗？
+
+不建议改。网页缩放、窗口大小、棋盘大小变化后，最好重新校准。
+
+### 工具点错位置怎么办？
+
+先关闭自动走棋，把：
+
+```json
+"auto_move": false
+```
+
+确认识别正常后，再微调点击偏移，例如：
+
+```json
+"auto_move_click_offset_y": -10
+```
+
+### 使用第二个显示器怎么办？
+
+打开 `config.json`，把：
+
+```json
+"screen_monitor": 2
+```
+
+然后重新校准。
+
+如果想截取整个桌面，可以设为：
+
+```json
+"screen_monitor": 0
+```
+
+### Windows 上打不开怎么办？
+
+可以按顺序检查：
+
+1. Python 是否安装成功。
+2. 是否在本项目文件夹里打开命令窗口。
+3. 是否已经运行过安装命令。
+4. 是否已经完成校准。
+5. 文件夹里是否有 `pikafish.exe` 和 `pikafish.nnue`。
+
+### macOS 用户注意
+
+macOS 需要给终端程序开启“屏幕录制”权限。
+
+如果要自动走棋，还需要开启“辅助功能”权限。
+
+### Linux 用户注意
+
+自动走棋建议使用 X11 桌面环境。
+
+如果鼠标控制不可用，可以关闭自动走棋，只让工具显示推荐走法：
+
+```json
+"auto_move": false
+```
+
+## 主要文件说明
+
+- `main.py`：打开主界面。
+- `calibrate.py`：校准棋盘和棋子。
+- `vision.py`：识别屏幕上的棋盘。
+- `engine.py`：调用 Pikafish 计算走法。
+- `xiangqi_core.py`：处理象棋规则和局面。
+- `config.json`：保存设置。
+- `templates/`：保存校准时截取的棋盘和棋子图片。
+
+## 给完全不懂电脑的提醒
+
+不要随便移动或删除本文件夹里的文件。
+
+如果突然不能用了，最常见的原因是棋盘画面变了。先重新校准，一般就能解决。
