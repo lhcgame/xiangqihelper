@@ -123,43 +123,54 @@ def _score_engine(path, flags):
 
     known = bool(flags)
     if not known:
+        if "vnni512" in text:
+            return score + 100
+        if "avx512" in text:
+            return score + 90
+        if "bmi2" in text:
+            return score + 80
+        if "avx2" in text:
+            return score + 70
+        if "modern" in text or "avxvnni" in text:
+            return score + 60
         if "sse41-popcnt" in text or "sse4" in text:
             return score + 40
-        advanced_names = ("avx512icl", "vnni512", "avx512", "avxvnni", "avx2", "bmi2")
-        if any(name in text for name in advanced_names):
-            return score
-        return score + 10
+        if "ssse3" in text:
+            return score + 30
+        return score + 20
 
-    if "avx512icl" in text:
-        if known and not {"avx512f", "avx512bw", "avx512vl", "avx512vnni"}.issubset(flags):
-            return None
-        return score + 90
     if "vnni512" in text:
-        if known and not ("avx512f" in flags and ("avx512vnni" in flags or "vnni512" in flags)):
+        if known and "avx512f" not in flags:
             return None
-        return score + 85
+        return score + 100
+    if "avx512icl" in text:
+        if known and "avx512f" not in flags:
+            return None
+        return score + 95
     if "avx512" in text:
         if known and "avx512f" not in flags:
             return None
-        return score + 80
-    if "avxvnni" in text:
-        if known and "avxvnni" not in flags:
-            return None
-        return score + 70
-    if "avx2" in text:
-        if known and "avx2" not in flags:
-            return None
-        return score + 60
+        return score + 90
     if "bmi2" in text:
         if known and "bmi2" not in flags:
             return None
-        return score + 65
+        return score + 80
+    if "avx2" in text:
+        if known and "avx2" not in flags:
+            return None
+        return score + 70
+    if "modern" in text or "avxvnni" in text:
+        if known and "avxvnni" in text and "avxvnni" not in flags:
+            return None
+        return score + 60
     if "sse41-popcnt" in text or "sse4" in text:
         if known and not (("sse41" in flags or "sse4.1" in flags) and "popcnt" in flags):
             return None
         return score + 40
+    if "ssse3" in text:
+        return score + 30
 
-    return score + 10
+    return score + 20
 
 
 class Engine:
