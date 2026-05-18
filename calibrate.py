@@ -7,6 +7,17 @@ import sys
 
 from app_paths import candidate_paths, resolve_resource_path, resolve_user_path
 
+try:
+    from PyQt5.QtGui import QColor, QFont, QGuiApplication, QImage, QPainter
+except Exception:
+    QColor = None
+    QFont = None
+    QGuiApplication = None
+    QImage = None
+    QPainter = None
+
+_QT_APP = None
+
 TEMPLATE_DIR_NAME = "templates"
 CONFIG_FILE_NAME = "config.json"
 NEXT_GAME_BUTTON_TEMPLATE_NAME = "next_game_button.png"
@@ -165,9 +176,6 @@ def _draw_grid(canvas, pt1, pt2, scale):
 
 
 def _draw_message(canvas, lines):
-    font = cv2.FONT_HERSHEY_SIMPLEX
-    font_scale = 0.8
-    thickness = 2
     margin = 14
     line_height = 32
     box_height = margin * 2 + line_height * len(lines)
@@ -182,6 +190,42 @@ def _draw_message(canvas, lines):
     )
     cv2.addWeighted(overlay, 0.75, canvas, 0.25, 0, canvas)
 
+    if QGuiApplication is not None and QImage is not None and QPainter is not None:
+        try:
+            global _QT_APP
+            if QGuiApplication.instance() is None:
+                _QT_APP = QGuiApplication(sys.argv[:1])
+            rgb = cv2.cvtColor(canvas, cv2.COLOR_BGR2RGB)
+            height, width = rgb.shape[:2]
+            image = QImage(
+                rgb.data,
+                width,
+                height,
+                rgb.strides[0],
+                QImage.Format_RGB888,
+            ).copy()
+            painter = QPainter(image)
+            painter.setPen(QColor(220, 0, 0))
+            font = QFont("Microsoft YaHei", 18)
+            font.setBold(True)
+            painter.setFont(font)
+            for index, line in enumerate(lines):
+                painter.drawText(margin, margin + 24 + index * line_height, line)
+            painter.end()
+
+            image = image.convertToFormat(QImage.Format_RGB888)
+            ptr = image.bits()
+            ptr.setsize(image.byteCount())
+            arr = np.frombuffer(ptr, np.uint8).reshape((height, image.bytesPerLine()))
+            rgb = arr[:, : width * 3].reshape((height, width, 3))
+            canvas[:] = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
+            return
+        except Exception:
+            pass
+
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    font_scale = 0.8
+    thickness = 2
     for index, line in enumerate(lines):
         y = margin + 24 + index * line_height
         cv2.putText(
@@ -212,8 +256,8 @@ def pick_corners(full_img):
     cv2.moveWindow(window, 20, 20)
     cv2.setMouseCallback(window, on_mouse)
 
-    print("Click the top-left grid intersection, then the bottom-right grid intersection.")
-    print("Press ENTER to save, C to clear, or ESC to cancel.")
+    print("请依次点击棋盘左上角交叉点、右下角交叉点。")
+    print("按 Enter 保存，按 C 清空，按 Esc 取消。")
 
     while True:
         canvas = display.copy()
@@ -235,8 +279,8 @@ def pick_corners(full_img):
             )
 
         _draw_message(canvas, [
-            "Click the TOP-LEFT grid intersection, then the BOTTOM-RIGHT grid intersection.",
-            "Press ENTER to save. Press C to clear. Press ESC to cancel.",
+            "请依次点击棋盘左上角交叉点、右下角交叉点。",
+            "按 Enter 保存，按 C 清空，按 Esc 取消。",
         ])
         cv2.imshow(window, canvas)
         if not window_resized:
@@ -250,7 +294,7 @@ def pick_corners(full_img):
             points.clear()
         if key == 27:
             cv2.destroyWindow(window)
-            sys.exit("Calibration cancelled.")
+            sys.exit("已取消校准。")
 
     cv2.destroyWindow(window)
     return points[0], points[1]
@@ -293,7 +337,7 @@ def pick_point(full_img, window, lines):
             points.clear()
         if key == 27:
             cv2.destroyWindow(window)
-            sys.exit("Recognition cancelled.")
+            sys.exit("已取消识别。")
 
     cv2.destroyWindow(window)
     return points[0]
@@ -349,7 +393,7 @@ def pick_rectangle(full_img, window, lines):
             points.clear()
         if key == 27:
             cv2.destroyWindow(window)
-            sys.exit("Recognition cancelled.")
+            sys.exit("已取消识别。")
 
     cv2.destroyWindow(window)
     x1 = min(points[0][0], points[1][0])
@@ -357,7 +401,7 @@ def pick_rectangle(full_img, window, lines):
     x2 = max(points[0][0], points[1][0])
     y2 = max(points[0][1], points[1][1])
     if x2 - x1 < 10 or y2 - y1 < 10:
-        sys.exit("Selected area is too small.")
+        sys.exit("选择区域太小。")
     return x1, y1, x2, y2
 
 
@@ -370,7 +414,7 @@ def _crop_button_template(full_img, point):
     y2 = min(height, int(round(y + NEXT_GAME_TEMPLATE_HALF_H)))
     crop = full_img[y1:y2, x1:x2]
     if crop.shape[0] < 10 or crop.shape[1] < 10:
-        sys.exit("Button template is too small. Click the center of the Next Game button.")
+        sys.exit("按钮模板太小，请点击“下一局”按钮中心。")
     return crop
 
 
@@ -394,22 +438,22 @@ def save_next_game_button(full_img, point, monitor_info=None):
     if monitor_info:
         config["screen_monitor"] = int(monitor_info.get("index", config.get("screen_monitor", 1)))
     save_config(config)
-    print(f"Saved {CONFIG_FILE_NAME} and templates/{NEXT_GAME_BUTTON_TEMPLATE_NAME}.")
+    print(f"已保存 {CONFIG_FILE_NAME} 和 templates/{NEXT_GAME_BUTTON_TEMPLATE_NAME}。")
 
 
 def run_next_game_recognition(prompt=True):
-    print("Next game button recognition")
-    print("Open the game-over screen so the Next Game button is visible.")
+    print("下一局按钮识别")
+    print("请打开结算界面，让“下一局”按钮可见。")
     if prompt:
-        input("Press ENTER to capture the screen...")
+        input("按 Enter 截图...")
 
     full_img, monitor_info = capture_screen(return_monitor=True)
-    point = pick_point(full_img, "Recognize Next Game", [
-        "Click the CENTER of the Next Game button.",
-        "Press ENTER to save. Press C to clear. Press ESC to cancel.",
+    point = pick_point(full_img, "识别下一局按钮", [
+        "请点击“下一局”按钮中心。",
+        "按 Enter 保存，按 C 清空，按 Esc 取消。",
     ])
     save_next_game_button(full_img, point, monitor_info)
-    print("Done.")
+    print("完成。")
 
 
 def _circle_mask(size=PATCH_SIZE):
@@ -470,7 +514,7 @@ def save_calibration(full_img, top_left, bottom_right, templates, monitor_info=N
     dx = (x2 - x1) / 8.0
     dy = (y2 - y1) / 9.0
     if dx <= 4 or dy <= 4:
-        sys.exit("Corners look wrong. Click top-left first, then bottom-right.")
+        sys.exit("棋盘角点不正确，请先点左上角，再点右下角。")
 
     template_dir = _template_write_dir()
     os.makedirs(template_dir, exist_ok=True)
@@ -514,28 +558,28 @@ def save_calibration(full_img, top_left, bottom_right, templates, monitor_info=N
         if name in templates:
             cv2.imwrite(path, templates[name])
 
-    print(f"Saved {CONFIG_FILE_NAME}, templates/ref_board.png, and {len(templates)} templates.")
+    print(f"已保存 {CONFIG_FILE_NAME}、templates/ref_board.png 和 {len(templates)} 个模板。")
 
 
 def run_calibration(prompt=True):
-    print("Pikafish helper calibration")
-    print("Put the board in the standard starting position.")
+    print("Pikafish 助手校准")
+    print("请把棋盘摆到标准初始局面。")
     if prompt:
-        input("Press ENTER to capture the screen...")
+        input("按 Enter 截图...")
 
     full_img, monitor_info = capture_screen(return_monitor=True)
     top_left, bottom_right = pick_corners(full_img)
     dx = (bottom_right[0] - top_left[0]) / 8.0
     dy = (bottom_right[1] - top_left[1]) / 9.0
 
-    print(f"Grid spacing: dx={dx:.2f}, dy={dy:.2f}")
-    print("Building templates...")
+    print(f"棋盘网格间距：dx={dx:.2f}, dy={dy:.2f}")
+    print("正在生成棋子模板...")
     templates = build_templates(full_img, top_left, dx, dy)
     if len(templates) != len(PIECE_NAMES):
-        print("Warning: not every piece type was captured. Make sure the board is at start.")
+        print("警告：没有捕获到全部棋子类型，请确认棋盘是初始局面。")
 
     save_calibration(full_img, top_left, bottom_right, templates, monitor_info)
-    print("Done. Run `python main.py` to start the helper.")
+    print("完成。运行 `python main.py` 启动助手。")
 
 
 def main():

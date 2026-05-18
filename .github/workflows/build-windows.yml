@@ -99,8 +99,8 @@ jobs:
           1. 解压整个文件夹，不要只拖出 exe。
           2. 双击 XiangqiHelper.exe 启动。
           3. 第一次使用：打开 连线 -> 设置 -> 校准棋盘。
-          4. 联机使用：打开棋局画面后，点 连线 -> 开始。
-          5. 自动走棋：在 连线 -> 设置 里勾选“自动走棋”。
+          4. 联机使用：打开棋局画面后，点工具栏“自动走棋”或“观战”。
+          5. 自动走棋会自动点击走棋；观战只分析，不点击鼠标。
           6. 保存棋谱：点 棋局 -> 保存棋谱，文件会保存到 records 文件夹。
 
           开局库：
@@ -113,7 +113,7 @@ jobs:
 
           注意：
           - 棋盘大小、皮肤、浏览器缩放变了以后，建议重新校准。
-          - 如果点击位置不准，先关闭自动走棋，确认识别正常后再重新校准。
+          - 如果点击位置不准，先关闭自动走棋，改用观战确认识别正常后再重新校准。
           - 不要删除 assets、templates、pikafish、pikafish.nnue 等文件。
           "@ | Set-Content -Path "dist/$env:APP_NAME/README.txt" -Encoding UTF8
           Copy-Item -LiteralPath "dist/$env:APP_NAME/README.txt" -Destination "dist/$env:APP_NAME/使用说明.txt" -Force

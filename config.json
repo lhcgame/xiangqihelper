@@ -18,7 +18,7 @@
     "auto_move_double_click_interval": 0.08,
     "auto_move_search_time_min": 2.0,
     "auto_move_search_time_max": 5.0,
-    "engine_threads": 8,
+    "engine_threads": 1,
     "board_unchanged_search_seconds": 6,
     "auto_change_repetition": true,
     "repetition_move_memory": 5,

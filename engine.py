@@ -279,12 +279,17 @@ class Engine:
         self.bestmove = None
         self.eval_score = ""
         self.current_depth = 0
+        self.current_time_ms = 0
+        self.current_nps = 0
         self.current_pv_move = None
         self.current_pv_line = []
         # multipv index (1..N) -> first move of that line, in engine coords
         self.pv_moves = {}
         self.pv_lines = {}
         self.pv_scores = {}
+        self.pv_depths = {}
+        self.pv_times = {}
+        self.pv_nps = {}
         self._ready_event = threading.Event()
 
         # Start a thread to read engine output continuously
@@ -293,17 +298,34 @@ class Engine:
 
         self.send_cmd("uci")
         time.sleep(0.5)
+        self.apply_runtime_config()
+
+    def _configured_threads(self):
         try:
-            threads = max(1, int(float(load_config().get("engine_threads", 1))))
+            return max(1, int(float(load_config().get("engine_threads", 1))))
         except Exception:
-            threads = 1
+            return 1
+
+    def _configured_hash_mb(self):
+        try:
+            return min(4096, max(1, int(float(load_config().get("engine_hash", 128)))))
+        except Exception:
+            return 128
+
+    def apply_runtime_config(self):
+        if not self.process or self.process.poll() is not None:
+            return
+        threads = self._configured_threads()
+        hash_mb = self._configured_hash_mb()
         self.send_cmd(f"setoption name Threads value {threads}")
+        self.send_cmd(f"setoption name Hash value {hash_mb}")
         if self.abs_nnue_path:
             self.send_cmd(f"setoption name EvalFile value {self.abs_nnue_path}")
         # Ask the engine for several lines so callers can pick an
         # alternative when a position recurs and the #1 move would loop.
         self.send_cmd("setoption name MultiPV value 5")
         self.wait_for_ready(timeout=4.0)
+        return {"threads": threads, "hash_mb": hash_mb}
 
     def restart(self):
         print("\n[Engine] Restarting engine...")
@@ -341,8 +363,27 @@ class Engine:
                     if "depth" in parts:
                         try:
                             depth = int(parts[parts.index("depth") + 1])
+                            self.pv_depths[mpv_idx] = depth
                             if mpv_idx == 1:
                                 self.current_depth = depth
+                        except (ValueError, IndexError):
+                            pass
+
+                    if "time" in parts:
+                        try:
+                            time_ms = int(parts[parts.index("time") + 1])
+                            self.pv_times[mpv_idx] = time_ms
+                            if mpv_idx == 1:
+                                self.current_time_ms = time_ms
+                        except (ValueError, IndexError):
+                            pass
+
+                    if "nps" in parts:
+                        try:
+                            nps = int(parts[parts.index("nps") + 1])
+                            self.pv_nps[mpv_idx] = nps
+                            if mpv_idx == 1:
+                                self.current_nps = nps
                         except (ValueError, IndexError):
                             pass
 
@@ -392,7 +433,7 @@ class Engine:
         if not self._ready_event.is_set():
             raise TimeoutError("Engine did not respond with readyok")
 
-    def start_search(self, fen, movetime=None, depth=None, should_cancel=None):
+    def start_search(self, fen, movetime=None, depth=None, should_cancel=None, infinite=False):
         if self.process.poll() is not None:
             self.restart()
 
@@ -408,11 +449,16 @@ class Engine:
         self.bestmove = None
         self.eval_score = ""
         self.current_depth = 0
+        self.current_time_ms = 0
+        self.current_nps = 0
         self.current_pv_move = None
         self.current_pv_line = []
         self.pv_moves = {}
         self.pv_lines = {}
         self.pv_scores = {}
+        self.pv_depths = {}
+        self.pv_times = {}
+        self.pv_nps = {}
         self.send_cmd("ucinewgame")
         self.wait_for_ready(should_cancel=should_cancel)
 
@@ -420,7 +466,9 @@ class Engine:
             raise InterruptedError("Engine search cancelled")
 
         self.send_cmd(f"position fen {fen}")
-        if movetime is not None:
+        if infinite:
+            self.send_cmd("go infinite")
+        elif movetime is not None:
             self.send_cmd(f"go movetime {movetime}")
         elif depth is not None:
             self.send_cmd(f"go depth {depth}")
