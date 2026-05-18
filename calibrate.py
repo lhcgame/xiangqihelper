@@ -412,41 +412,6 @@ def run_next_game_recognition(prompt=True):
     print("Done.")
 
 
-def save_turn_indicator_region(rect, monitor_info=None):
-    x1, y1, x2, y2 = rect
-    screen_left = int(monitor_info.get("left", 0)) if monitor_info else 0
-    screen_top = int(monitor_info.get("top", 0)) if monitor_info else 0
-    config = _load_existing_config()
-    config.update({
-        "turn_indicator_x1": float(x1 + screen_left),
-        "turn_indicator_y1": float(y1 + screen_top),
-        "turn_indicator_x2": float(x2 + screen_left),
-        "turn_indicator_y2": float(y2 + screen_top),
-        "turn_indicator_screen_left": screen_left,
-        "turn_indicator_screen_top": screen_top,
-        "auto_turn_indicator": True,
-    })
-    if monitor_info:
-        config["screen_monitor"] = int(monitor_info.get("index", config.get("screen_monitor", 1)))
-    save_config(config)
-    print(f"Saved turn indicator area to {CONFIG_FILE_NAME}.")
-
-
-def run_turn_indicator_recognition(prompt=True):
-    print("Turn avatar recognition")
-    print("Open the board while your own avatar green countdown ring is visible.")
-    if prompt:
-        input("Press ENTER to capture the screen...")
-
-    full_img, monitor_info = capture_screen(return_monitor=True)
-    rect = pick_rectangle(full_img, "Recognize Turn Avatar", [
-        "Click TOP-LEFT then BOTTOM-RIGHT around your avatar green countdown ring.",
-        "Press ENTER to save. Press C to clear. Press ESC to cancel.",
-    ])
-    save_turn_indicator_region(rect, monitor_info)
-    print("Done.")
-
-
 def _circle_mask(size=PATCH_SIZE):
     mask = np.zeros((size, size, 3), dtype=np.uint8)
     cv2.circle(mask, (size // 2, size // 2), int(size * 0.94 / 2), (1, 1, 1), -1)

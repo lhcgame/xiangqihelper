@@ -2,21 +2,19 @@ name: Build Windows app
 
 on:
   workflow_dispatch:
+  push:
+    tags:
+      - "v*"
 
 env:
   PYTHON_VERSION: "3.11"
-  PIKAFISH_URL: "https://github.com/official-pikafish/Pikafish/releases/download/Pikafish-2026-01-02/Pikafish.2026-01-02.7z"
-  RELEASE_DIR: "Windows"
+  APP_NAME: "XiangqiHelper"
   ARTIFACT_NAME: "XiangqiHelper-windows-x64"
-  DATA_SEP: ";"
 
 jobs:
   build-windows:
     name: Build Windows x64
     runs-on: windows-latest
-    defaults:
-      run:
-        shell: bash
 
     steps:
       - name: Check out repository
@@ -27,87 +25,105 @@ jobs:
         with:
           python-version: ${{ env.PYTHON_VERSION }}
 
-      - name: Install 7-Zip
-        run: choco install 7zip -y --no-progress
-
       - name: Install Python packages
+        shell: pwsh
         run: |
           python -m pip install --upgrade pip
           python -m pip install -r requirements.txt pyinstaller
 
-      - name: Download Pikafish release
+      - name: Verify bundled runtime files
+        shell: pwsh
         run: |
-          python - <<'PY'
-          import os
-          import urllib.request
+          $required = @(
+            "main.py",
+            "config.json",
+            "assets/boardchess.jpg",
+            "templates/ref_board.png",
+            "pikafish.nnue"
+          )
+          foreach ($path in $required) {
+            if (-not (Test-Path -LiteralPath $path)) {
+              throw "Missing required file: $path"
+            }
+          }
+          $engines = Get-ChildItem -LiteralPath . -Filter "pikafish*.exe" -File
+          if (-not $engines) {
+            throw "Missing required engine files: pikafish*.exe"
+          }
+          $engines | Select-Object Name, Length
 
-          url = os.environ["PIKAFISH_URL"]
-          print(f"Downloading {url}")
-          urllib.request.urlretrieve(url, "pikafish.7z")
-          PY
-
-      - name: Extract Pikafish release
-        run: 7z x pikafish.7z -opikafish-release -y
-
-      - name: Bundle Windows engines and NNUE
+      - name: Build app with PyInstaller
+        shell: pwsh
         run: |
-          python - <<'PY'
-          import os
-          import shutil
-          from pathlib import Path
-
-          release_dir = Path("pikafish-release")
-          platform_dir_name = os.environ["RELEASE_DIR"]
-          platform_dir = release_dir / platform_dir_name
-
-          files = [p for p in release_dir.rglob("*") if p.is_file()]
-          if not files:
-              raise SystemExit("No files found after extracting Pikafish release")
-
-          nnues = [p for p in files if p.suffix.lower() == ".nnue"]
-          if not nnues:
-              raise SystemExit("No .nnue file found in Pikafish release")
-          nnue = max(nnues, key=lambda p: p.stat().st_size)
-          shutil.copy2(nnue, "pikafish.nnue")
-          print(f"Selected NNUE: {nnue}")
-
-          if not platform_dir.is_dir():
-              raise SystemExit(f"Release folder not found: {platform_dir}")
-
-          dest_dir = Path("engines") / platform_dir_name
-          dest_dir.mkdir(parents=True, exist_ok=True)
-          copied = []
-          for engine in sorted(platform_dir.glob("pikafish*.exe")):
-              if engine.is_file():
-                  dest = dest_dir / engine.name
-                  shutil.copy2(engine, dest)
-                  copied.append(dest)
-
-          if not copied:
-              raise SystemExit(f"No engine binaries found in {platform_dir}")
-
-          print("Bundled engines:")
-          for path in copied:
-              print(f"  {path}")
-          PY
-
-      - name: Build app
-        run: |
-          python -m PyInstaller \
-            --noconfirm \
-            --clean \
-            --onedir \
-            --windowed \
-            --name XiangqiHelper \
-            --add-data "config.json${DATA_SEP}." \
-            --add-data "templates${DATA_SEP}templates" \
-            --add-data "engines${DATA_SEP}engines" \
-            --add-data "pikafish.nnue${DATA_SEP}." \
+          python -m PyInstaller `
+            --noconfirm `
+            --clean `
+            --onedir `
+            --windowed `
+            --name $env:APP_NAME `
+            --add-data "config.json;." `
+            --add-data "assets;assets" `
+            --add-data "templates;templates" `
+            --add-data "pikafish.nnue;." `
             main.py
+
+      - name: Copy CPU-specific Pikafish engines
+        shell: pwsh
+        run: |
+          $appDir = "dist/$env:APP_NAME"
+          Get-ChildItem -LiteralPath . -Filter "pikafish*.exe" -File |
+            Copy-Item -Destination $appDir -Force
+
+      - name: Copy optional opening book
+        shell: pwsh
+        run: |
+          $appDir = "dist/$env:APP_NAME"
+          if (Test-Path -LiteralPath "book.xqb") {
+            Copy-Item -LiteralPath "book.xqb" -Destination $appDir -Force
+            Write-Host "Included book.xqb"
+          } else {
+            Write-Host "book.xqb not found in repository; package will run without bundled opening book."
+          }
+
+      - name: Add user notes
+        shell: pwsh
+        run: |
+          Copy-Item -LiteralPath "README.md" -Destination "dist/$env:APP_NAME/README.md" -Force
+          New-Item -ItemType Directory -Force -Path "dist/$env:APP_NAME/records" | Out-Null
+          @"
+          双击 XiangqiHelper.exe 启动象棋助手。
+
+          第一次使用请打开：连线 -> 设置 -> 校准棋盘。
+          如果需要开局库，把 book.xqb 放到本文件夹即可。
+          "@ | Set-Content -Path "dist/$env:APP_NAME/使用说明.txt" -Encoding UTF8
+
+      - name: Smoke test executable exists
+        shell: pwsh
+        run: |
+          $exe = "dist/$env:APP_NAME/$env:APP_NAME.exe"
+          if (-not (Test-Path -LiteralPath $exe)) {
+            throw "Build failed: $exe was not created"
+          }
+          Get-ChildItem -LiteralPath "dist/$env:APP_NAME" | Select-Object Name, Length
+
+      - name: Create zip package
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path package | Out-Null
+          Compress-Archive `
+            -Path "dist/$env:APP_NAME/*" `
+            -DestinationPath "package/$env:ARTIFACT_NAME.zip" `
+            -Force
 
       - name: Upload Windows artifact
         uses: actions/upload-artifact@v4
         with:
           name: ${{ env.ARTIFACT_NAME }}
-          path: dist/**
+          path: package/${{ env.ARTIFACT_NAME }}.zip
           if-no-files-found: error
+
+      - name: Upload package to GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: package/${{ env.ARTIFACT_NAME }}.zip

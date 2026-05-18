@@ -7,6 +7,7 @@ import sys
 import stat
 
 from app_paths import candidate_paths, resolve_resource_path
+from calibrate import load_config
 
 
 DEFAULT_ENGINE_PATH = None
@@ -183,6 +184,13 @@ class Engine:
                     if name.lower().startswith("pikafish"):
                         paths.append(os.path.join(root, name))
 
+        for root in _project_path_candidates("."):
+            if not os.path.isdir(root):
+                continue
+            for name in os.listdir(root):
+                if name.lower().startswith("pikafish"):
+                    paths.append(os.path.join(root, name))
+
         for fallback in _project_path_candidates(FALLBACK_ENGINE_PATH):
             if os.path.exists(fallback):
                 paths.append(fallback)
@@ -274,6 +282,11 @@ class Engine:
 
         self.send_cmd("uci")
         time.sleep(0.5)
+        try:
+            threads = max(1, int(float(load_config().get("engine_threads", 1))))
+        except Exception:
+            threads = 1
+        self.send_cmd(f"setoption name Threads value {threads}")
         if self.abs_nnue_path:
             self.send_cmd(f"setoption name EvalFile value {self.abs_nnue_path}")
         # Ask the engine for several lines so callers can pick an

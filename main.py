@@ -49,7 +49,6 @@ from calibrate import calibration_exists
 from calibrate import load_config
 from calibrate import NEXT_GAME_BUTTON_TEMPLATE_NAME
 from calibrate import run_next_game_recognition
-from calibrate import run_turn_indicator_recognition
 from calibrate import run_calibration as run_calibration_flow
 from calibrate import update_config
 from app_paths import candidate_paths, resolve_resource_path
@@ -110,10 +109,7 @@ NEXT_GAME_SEARCH_RADIUS_DEFAULT = 220.0
 NEXT_GAME_MATCH_THRESHOLD_DEFAULT = 0.88
 NEXT_GAME_CLICK_COOLDOWN_DEFAULT = 5.0
 NEXT_GAME_SCAN_INTERVAL_DEFAULT = 0.25
-TURN_GREEN_RATIO_DEFAULT = 0.015
-TURN_GREEN_DROP_DEFAULT = 0.002
-TURN_INDICATOR_STABLE_FRAMES_DEFAULT = 3
-TURN_INACTIVE_STABLE_FRAMES_DEFAULT = 3
+BOARD_STABLE_FRAMES_DEFAULT = 3
 
 
 def dprint(*args, **kwargs):
@@ -149,12 +145,6 @@ def _next_game_recognition_command():
     return [sys.executable, os.path.join(_app_dir(), "main.py"), "--recognize-next", "--no-prompt"]
 
 
-def _turn_indicator_recognition_command():
-    if getattr(sys, "frozen", False):
-        return [sys.executable, "--recognize-turn", "--no-prompt"]
-    return [sys.executable, os.path.join(_app_dir(), "main.py"), "--recognize-turn", "--no-prompt"]
-
-
 class App:
     def __init__(
         self,
@@ -164,12 +154,14 @@ class App:
         move_callback=None,
         fen_callback=None,
         analysis_callback=None,
+        record_callback=None,
         enable_mouse=True,
     ):
         self.board_callback = board_callback
         self.move_callback = move_callback
         self.fen_callback = fen_callback
         self.analysis_callback = analysis_callback
+        self.record_callback = record_callback
         try:
             self.vis = Vision()
         except Exception as e:
@@ -190,15 +182,10 @@ class App:
         self.last_seen_fen = None
         self.stable_count = 0
         self.last_status = None
-        self.last_turn_active = False
-        self.turn_action_done = False
-        self.turn_inactive_count = 0
         self.next_game_last_click_at = 0.0
         self.next_game_last_scan_at = 0.0
         self.waiting_for_new_game = False
         self.manual_result_hold_until = 0.0
-        self.turn_indicator_last_ratio = None
-        self.turn_indicator_missing_logged_at = 0.0
         self.board_change_initialized = False
         self.board_change_baseline_key = None
         self.board_change_baseline_fen = None
@@ -206,6 +193,9 @@ class App:
         self.board_change_invalid_key = None
         self.board_change_invalid_count = 0
         self.board_change_strict_baseline = False
+        self.record_start_fen = None
+        self.record_moves = []
+        self.record_saved = False
         self._next_game_template = None
         self._next_game_template_path = None
         self._next_game_template_mtime = None
@@ -270,12 +260,8 @@ class App:
         self.last_seen_fen = None
         self.stable_count = 0
         self.last_status = None
-        self.last_turn_active = False
-        self.turn_action_done = False
-        self.turn_inactive_count = 0
         self.waiting_for_new_game = False
         self.manual_result_hold_until = 0.0
-        self.turn_indicator_last_ratio = None
         self.board_change_initialized = False
         self.board_change_baseline_key = None
         self.board_change_baseline_fen = None
@@ -283,6 +269,9 @@ class App:
         self.board_change_invalid_key = None
         self.board_change_invalid_count = 0
         self.board_change_strict_baseline = False
+        self.record_start_fen = None
+        self.record_moves = []
+        self.record_saved = False
 
     def _emit_move(self, move, label="PV"):
         if self.move_callback is not None:
@@ -291,6 +280,10 @@ class App:
     def _emit_analysis(self, text):
         if self.analysis_callback is not None:
             self.analysis_callback(text)
+
+    def _emit_record(self):
+        if self.record_callback is not None:
+            self.record_callback(self._record_history_text())
 
     def _format_engine_analysis(self, fen=None, flipped=False):
         lines = []
@@ -562,92 +555,6 @@ class App:
         self._print_status_once("Clicked next game; waiting for new game...")
         return True
 
-    def _turn_indicator_region(self, screen_img):
-        required = (
-            "turn_indicator_x1",
-            "turn_indicator_y1",
-            "turn_indicator_x2",
-            "turn_indicator_y2",
-        )
-        if not all(key in self.vis.config for key in required):
-            return None
-
-        screen_left = self._config_float(
-            "turn_indicator_screen_left",
-            self._config_float("screen_left", 0.0),
-        )
-        screen_top = self._config_float(
-            "turn_indicator_screen_top",
-            self._config_float("screen_top", 0.0),
-        )
-        x1 = self._config_float("turn_indicator_x1", 0.0) - screen_left
-        y1 = self._config_float("turn_indicator_y1", 0.0) - screen_top
-        x2 = self._config_float("turn_indicator_x2", 0.0) - screen_left
-        y2 = self._config_float("turn_indicator_y2", 0.0) - screen_top
-        x1, x2 = sorted((int(round(x1)), int(round(x2))))
-        y1, y2 = sorted((int(round(y1)), int(round(y2))))
-        x1 = max(0, x1)
-        y1 = max(0, y1)
-        x2 = min(screen_img.shape[1], x2)
-        y2 = min(screen_img.shape[0], y2)
-        if x2 - x1 < 10 or y2 - y1 < 10:
-            return None
-        return x1, y1, x2, y2
-
-    def _turn_indicator_missing(self):
-        now = time.time()
-        if now - self.turn_indicator_missing_logged_at > 5.0:
-            self.turn_indicator_missing_logged_at = now
-            dprint("[Turn avatar] area missing. Click Recognize Turn first.")
-
-    def _turn_indicator_green_ratio(self, screen_img):
-        region = self._turn_indicator_region(screen_img)
-        if region is None:
-            self._turn_indicator_missing()
-            return None
-
-        x1, y1, x2, y2 = region
-        roi = screen_img[y1:y2, x1:x2]
-        hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
-        lower = (
-            self._config_int("turn_green_h_min", 35),
-            self._config_int("turn_green_s_min", 45),
-            self._config_int("turn_green_v_min", 45),
-        )
-        upper = (
-            self._config_int("turn_green_h_max", 95),
-            255,
-            255,
-        )
-        mask = cv2.inRange(hsv, lower, upper)
-        return float(cv2.countNonZero(mask)) / float(mask.size)
-
-    def _own_turn_indicator_active(self, screen_img):
-        if not self._config_bool("auto_turn_indicator", default=True):
-            return False
-
-        ratio = self._turn_indicator_green_ratio(screen_img)
-        if ratio is None:
-            return False
-
-        previous = self.turn_indicator_last_ratio
-        self.turn_indicator_last_ratio = ratio
-
-        threshold = self._config_float("turn_green_min_ratio", TURN_GREEN_RATIO_DEFAULT)
-        if ratio < threshold:
-            return False
-
-        if self._config_bool("turn_indicator_trigger_on_visible", default=True):
-            return True
-
-        drop = self._config_float("turn_green_drop_ratio", TURN_GREEN_DROP_DEFAULT)
-        if previous is None or previous < threshold:
-            return True
-        return ratio <= previous - drop
-
-    def _use_avatar_turn_indicator(self):
-        return self._config_bool("online_use_avatar_turn_indicator", default=False)
-
     def _fen_board_key(self, fen):
         return fen.strip().split()[0] if fen else ""
 
@@ -674,20 +581,161 @@ class App:
         self._set_board_change_baseline(fen)
         self.board_change_strict_baseline = True
 
-    def _is_legal_next_board_key(self, current_key):
-        if not self.board_change_baseline_fen:
-            return True
+    def _find_legal_transition(self, from_fen, current_key, sides=None):
+        if not from_fen:
+            return None
         try:
-            board, baseline_side = fen_to_board(self.board_change_baseline_fen)
-            for side in (baseline_side, opponent(baseline_side)):
+            board, baseline_side = fen_to_board(from_fen)
+            side_order = sides if sides is not None else (
+                baseline_side,
+                opponent(baseline_side),
+            )
+            tried = []
+            for side in side_order:
+                if side in tried:
+                    continue
+                tried.append(side)
                 for move in legal_moves(board, side):
                     next_board = apply_uci(board, move)
-                    if self._fen_board_key(board_to_fen(next_board, opponent(side))) == current_key:
-                        return True
+                    move_from_fen = board_to_fen(board, side)
+                    next_fen = board_to_fen(next_board, opponent(side))
+                    if self._fen_board_key(next_fen) == current_key:
+                        return {
+                            "from_fen": move_from_fen,
+                            "to_fen": next_fen,
+                            "move": move,
+                            "side": side,
+                        }
         except Exception as e:
             dprint(f"[Board change validation skipped] {e}")
-            return True
-        return False
+            return None
+        return None
+
+    def _find_legal_transition_from_baseline(self, current_key):
+        return self._find_legal_transition(self.board_change_baseline_fen, current_key)
+
+    def _is_legal_next_board_key(self, current_key):
+        return not self.board_change_baseline_fen or self._find_legal_transition_from_baseline(current_key) is not None
+
+    def _record_move(self, from_fen, move, source):
+        try:
+            board, side = fen_to_board(from_fen)
+            to_fen = apply_uci_to_fen(from_fen, move)
+            notation = move_to_chinese(board, move)
+        except Exception as e:
+            dprint(f"[Record skipped] {source} {move}: {e}")
+            return
+
+        if self.record_moves and self.record_moves[-1].get("to_fen") == to_fen:
+            return
+        if self.record_start_fen is None:
+            self.record_start_fen = from_fen
+        self.record_moves.append({
+            "ply": len(self.record_moves) + 1,
+            "side": side,
+            "move": move,
+            "notation": notation,
+            "from_fen": from_fen,
+            "to_fen": to_fen,
+            "source": source,
+        })
+        self.record_saved = False
+        self._emit_record()
+
+    def _record_transition(self, transition, source):
+        if transition:
+            self._record_move(transition["from_fen"], transition["move"], source)
+
+    def _record_history_text(self):
+        if not self.record_moves:
+            return "还没有走法。"
+
+        lines = []
+        for index in range(0, len(self.record_moves), 2):
+            red = self.record_moves[index]
+            red_text = red.get("notation") or red.get("move", "")
+            black_text = ""
+            if index + 1 < len(self.record_moves):
+                black = self.record_moves[index + 1]
+                black_text = black.get("notation") or black.get("move", "")
+            line = f"第{index // 2 + 1}回合  {red_text}"
+            if black_text:
+                line += f"    {black_text}"
+            lines.append(line)
+        return "\n".join(lines)
+
+    def _record_dir(self):
+        path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "records")
+        os.makedirs(path, exist_ok=True)
+        return path
+
+    def _save_game_record(self, reason=""):
+        if self.record_saved or not self.record_moves:
+            return None
+        path = self._write_record_moves(self.record_moves, self.record_start_fen, reason)
+        if path:
+            self.record_saved = True
+        return path
+
+    def _write_record_moves(self, moves, start_fen=None, reason=""):
+        if not moves:
+            return None
+        stamp = time.strftime("%Y%m%d-%H%M%S")
+        path = os.path.join(self._record_dir(), f"xiangqi-{stamp}.pgn")
+        lines = [
+            '[Event "象棋助手联机记录"]',
+            f'[Date "{time.strftime("%Y.%m.%d")}"]',
+            f'[Reason "{reason or "manual"}"]',
+        ]
+        if start_fen and start_fen != START_FEN:
+            lines.append(f'[FEN "{start_fen}"]')
+        lines.append("")
+        move_parts = []
+        for index in range(0, len(moves), 2):
+            red = moves[index]["move"]
+            black = moves[index + 1]["move"] if index + 1 < len(moves) else ""
+            move_parts.append(f"{index // 2 + 1}. {red}" + (f" {black}" if black else ""))
+        lines.append(" ".join(move_parts))
+        lines.append("")
+        with open(path, "w", encoding="utf-8") as file:
+            file.write("\n".join(lines))
+        dprint(f"[Record] saved {path}")
+        return path
+
+    def save_current_record(self, reason="manual"):
+        path = self._save_game_record(reason)
+        if path:
+            return path
+        if not self.history_moves:
+            return None
+        moves = []
+        for index, move in enumerate(self.history_moves):
+            from_fen = self.history_fens[index] if index < len(self.history_fens) else ""
+            try:
+                board, side = fen_to_board(from_fen)
+                notation = move_to_chinese(board, move)
+                to_fen = apply_uci_to_fen(from_fen, move)
+            except Exception:
+                side = "red" if index % 2 == 0 else "black"
+                notation = move
+                to_fen = ""
+            moves.append({
+                "ply": index + 1,
+                "side": side,
+                "move": move,
+                "notation": notation,
+                "from_fen": from_fen,
+                "to_fen": to_fen,
+                "source": "local",
+            })
+        start_fen = self.history_fens[0] if self.history_fens else START_FEN
+        return self._write_record_moves(moves, start_fen, reason)
+
+    def _clear_game_record(self):
+        self.record_start_fen = None
+        self.record_moves = []
+        self.record_saved = False
+        self._emit_record()
 
     def _invalid_board_recovered(self, fen, current_key, min_stable):
         if self.board_change_invalid_key == current_key:
@@ -710,17 +758,8 @@ class App:
         return max(
             1,
             self._config_int(
-                "turn_indicator_min_stable_frames",
-                TURN_INDICATOR_STABLE_FRAMES_DEFAULT,
-            ),
-        )
-
-    def _turn_inactive_frame_count_needed(self):
-        return max(
-            1,
-            self._config_int(
-                "turn_indicator_inactive_frames",
-                TURN_INACTIVE_STABLE_FRAMES_DEFAULT,
+                "board_stable_frames",
+                BOARD_STABLE_FRAMES_DEFAULT,
             ),
         )
 
@@ -1009,7 +1048,7 @@ class App:
                 self.waiting_for_new_game = False
                 self._print_status_once("New game ready; waiting for my turn...")
 
-            if not self._use_avatar_turn_indicator():
+            if True:
                 force = self._recalc.is_set()
                 current_key = self._fen_board_key(fen)
                 if not self.board_change_initialized:
@@ -1021,8 +1060,30 @@ class App:
                             return
                         self._recalc.clear()
                         moved_or_reported = self._calculate_and_print(fen, flipped)
-                        if moved_or_reported:
-                            self.turn_action_done = True
+                        return
+                    if (
+                        not self._is_initial_board_key(current_key)
+                        and self._screen_player_side(flipped) == "black"
+                    ):
+                        if self.stable_count < min_stable:
+                            self._print_status_once(
+                                f"识别到当前局面，等待棋盘稳定 {self.stable_count}/{min_stable}..."
+                            )
+                            return
+                        transition = self._find_legal_transition(
+                            START_FEN,
+                            current_key,
+                            sides=("red",),
+                        )
+                        if transition is not None:
+                            self._record_transition(transition, "opponent")
+                            self._recalc.clear()
+                            self._print_status_once("已记录红方第一步，开始我方走棋...")
+                            moved_or_reported = self._calculate_and_print(fen, flipped)
+                            return
+                        self._recalc.clear()
+                        self._print_status_once("从当前局面开始，计算我方走法...")
+                        moved_or_reported = self._calculate_and_print(fen, flipped)
                         return
                     self._set_board_change_baseline(fen)
                     if self._is_initial_board_key(current_key):
@@ -1036,6 +1097,12 @@ class App:
                         self._print_status_once("对方红方先走，等待红方走棋...")
                     else:
                         self._print_status_once("等待对方走棋...")
+                    return
+
+                if self.record_moves and self._is_initial_board_key(current_key):
+                    self._reset_state()
+                    self._set_board_change_baseline(fen)
+                    self._print_status_once("新棋盘已识别，联机记录已清空。")
                     return
 
                 current_piece_count = self._piece_count_from_board_key(current_key)
@@ -1053,7 +1120,8 @@ class App:
                     )
                     return
 
-                if not force and not self._is_legal_next_board_key(current_key):
+                transition = self._find_legal_transition_from_baseline(current_key)
+                if not force and transition is None:
                     if (
                         not self.board_change_strict_baseline
                         and self._invalid_board_recovered(fen, current_key, min_stable)
@@ -1075,55 +1143,11 @@ class App:
                     )
                     return
 
+                if transition is not None:
+                    self._record_transition(transition, "opponent")
                 self._recalc.clear()
                 moved_or_reported = self._calculate_and_print(fen, flipped)
-                if moved_or_reported:
-                    self.turn_action_done = True
                 return
-
-            if not self._own_turn_indicator_active(img):
-                if time.time() < self.manual_result_hold_until:
-                    return
-                if self.last_turn_active:
-                    self.turn_inactive_count += 1
-                    needed = self._turn_inactive_frame_count_needed()
-                    if self.turn_inactive_count < needed:
-                        if self.turn_action_done:
-                            self._print_status_once(
-                                "Move already played; waiting for turn to end..."
-                            )
-                        else:
-                            self._print_status_once(
-                                f"Confirming turn end {self.turn_inactive_count}/{needed}..."
-                            )
-                        return
-                    dprint("[Turn avatar] turn ended; ready for next turn.")
-                self.last_turn_active = False
-                self.turn_action_done = False
-                self.turn_inactive_count = 0
-                self._print_status_once("Waiting for my turn...")
-                return
-
-            if not self.last_turn_active:
-                dprint("[Turn avatar] my turn detected.")
-            self.last_turn_active = True
-            self.turn_inactive_count = 0
-
-            force = self._recalc.is_set()
-            if self.turn_action_done and not force:
-                self._print_status_once("Move already played; waiting for turn to end...")
-                return
-
-            if self.stable_count < min_stable:
-                self._print_status_once(
-                    f"My turn detected; waiting stable board {self.stable_count}/{min_stable}..."
-                )
-                return
-
-            self._recalc.clear()
-            moved_or_reported = self._calculate_and_print(fen, flipped)
-            if moved_or_reported:
-                self.turn_action_done = True
 
         except Exception as e:
             if DEBUG:
@@ -1200,6 +1224,7 @@ class App:
         self.last_status = None
         moved = allow_auto_move and self._auto_move(fen, gui_move)
         if moved:
+            self._record_move(fen, bm, "me")
             try:
                 self._set_expected_own_move_baseline(apply_uci_to_fen(fen, bm))
             except Exception:
@@ -1250,8 +1275,10 @@ def launch_gui():
         QFormLayout,
         QGroupBox,
         QHBoxLayout,
+        QInputDialog,
         QLabel,
         QMainWindow,
+        QMenu,
         QMenuBar,
         QPlainTextEdit,
         QPushButton,
@@ -1267,6 +1294,7 @@ def launch_gui():
         move = pyqtSignal(str, str)
         fen = pyqtSignal(str)
         analysis = pyqtSignal(str)
+        record = pyqtSignal(str)
         local_move = pyqtSignal(str)
         ai_done = pyqtSignal()
         stopped = pyqtSignal()
@@ -1306,6 +1334,7 @@ def launch_gui():
             self.signals.move.connect(self.update_move_display)
             self.signals.fen.connect(self.update_fen)
             self.signals.analysis.connect(self.update_analysis_display)
+            self.signals.record.connect(self.update_record_display)
             self.signals.local_move.connect(self.apply_ai_move)
             self.signals.ai_done.connect(self.on_ai_done)
             self.signals.stopped.connect(self.on_stopped)
@@ -1322,6 +1351,7 @@ def launch_gui():
             self.current_move_label = ""
             self.current_fen = ""
             self.analysis_text = "还没有分析结果。"
+            self.online_record_text = ""
             self.settings_dialog = None
             self.analysis_dialog = None
             self.text_dialogs = []
@@ -1360,29 +1390,23 @@ def launch_gui():
 
             self.min_time_spin = self.make_seconds_spin(0.1, 60.0)
             self.max_time_spin = self.make_seconds_spin(0.1, 60.0)
+            self.engine_threads_spin = QSpinBox()
+            self.engine_threads_spin.setRange(1, 128)
+            self.engine_threads_spin.setValue(1)
             self.auto_move_checkbox = QCheckBox("自动走棋")
-            self.turn_indicator_checkbox = QCheckBox("旧方式：用头像判断轮到我")
             self.calibrate_button = QPushButton("校准棋盘")
-            self.recognize_turn_button = QPushButton("识别头像位置")
             self.auto_next_checkbox = QCheckBox("自动开始下一局")
-            self.active_next_scan_checkbox = QCheckBox("主动寻找下一局按钮")
             self.recognize_next_button = QPushButton("识别下一局按钮")
-            self.save_settings_button = QPushButton("保存设置")
             self.min_time_spin.setToolTip("引擎最少思考几秒。")
             self.max_time_spin.setToolTip("引擎最多思考几秒。")
+            self.engine_threads_spin.setToolTip("Pikafish 使用多少个 CPU 核心，默认 1。")
             self.auto_move_checkbox.setToolTip("勾选后程序会自动点击推荐走法；不勾选时只计算走法，不点鼠标。")
-            self.turn_indicator_checkbox.setToolTip("默认关闭。联机时建议用棋盘变化判断：对方走完棋后，我方自动计算。")
             self.calibrate_button.setToolTip("重新校准棋盘位置。")
-            self.recognize_turn_button.setToolTip("框选你头像旁的绿色倒计时圈，用来判断是不是轮到你。")
             self.auto_next_checkbox.setToolTip("一局结束后，如果识别到下一局按钮，就自动点击进入下一局。")
-            self.active_next_scan_checkbox.setToolTip("运行时持续扫描屏幕，尽快发现下一局按钮。")
             self.recognize_next_button.setToolTip("在结算界面点击下一局按钮中心，让程序记住按钮样子。")
-            self.save_settings_button.setToolTip("保存上面的设置到 config.json。")
 
             self.calibrate_button.clicked.connect(self.calibrate_helper)
-            self.recognize_turn_button.clicked.connect(self.recognize_turn_indicator)
             self.recognize_next_button.clicked.connect(self.recognize_next_game)
-            self.save_settings_button.clicked.connect(self.save_settings)
 
             move_time_row = QHBoxLayout()
             move_time_row.addWidget(self.min_time_spin)
@@ -1392,18 +1416,15 @@ def launch_gui():
             settings = QGroupBox("常用设置")
             settings_form = QFormLayout()
             settings_form.addRow("思考时间", move_time_row)
+            settings_form.addRow("引擎核心数量", self.engine_threads_spin)
             settings_form.addRow(self.auto_move_checkbox)
-            settings_form.addRow(self.turn_indicator_checkbox)
             settings_form.addRow("棋盘位置", self.calibrate_button)
-            settings_form.addRow("轮到我识别", self.recognize_turn_button)
             settings_form.addRow(self.auto_next_checkbox)
-            settings_form.addRow(self.active_next_scan_checkbox)
             settings_form.addRow("下一局识别", self.recognize_next_button)
-            settings_form.addRow("", self.save_settings_button)
             settings.setLayout(settings_form)
 
-            close_settings_button = QPushButton("关闭")
-            close_settings_button.clicked.connect(self.hide_settings_dialog)
+            close_settings_button = QPushButton("保存并关闭")
+            close_settings_button.clicked.connect(self.save_settings_and_close)
             settings_dialog_layout = QVBoxLayout()
             settings_dialog_layout.addWidget(settings)
             settings_dialog_layout.addWidget(close_settings_button)
@@ -1526,18 +1547,34 @@ def launch_gui():
         def create_menu_bar(self):
             menu_bar = QMenuBar()
 
-            file_menu = menu_bar.addMenu("文件(&F)")
+            game_menu = menu_bar.addMenu("棋局(&G)")
+            import_record_action = QAction("导入棋谱(&I)", self)
+            import_record_action.triggered.connect(self.import_game_record)
+            game_menu.addAction(import_record_action)
+            save_record_action = QAction("保存棋谱(&V)", self)
+            save_record_action.triggered.connect(self.save_game_record)
+            game_menu.addAction(save_record_action)
+            import_fen_action = QAction("导入 FEN(&F)", self)
+            import_fen_action.triggered.connect(self.import_fen_position)
+            game_menu.addAction(import_fen_action)
+            setup_record_action = QAction("摆谱(&S)", self)
+            setup_record_action.triggered.connect(self.start_position_setup_mode)
+            game_menu.addAction(setup_record_action)
+            new_board_action = QAction("新棋盘(&N)", self)
+            new_board_action.triggered.connect(self.start_new_board_mode)
+            game_menu.addAction(new_board_action)
+            game_menu.addSeparator()
             copy_fen_action = QAction("复制当前 FEN(&C)", self)
             copy_fen_action.triggered.connect(self.copy_fen)
             self.copy_fen_action = copy_fen_action
-            file_menu.addAction(copy_fen_action)
-            file_menu.addSeparator()
+            game_menu.addAction(copy_fen_action)
+            game_menu.addSeparator()
             exit_action = QAction("退出(&X)", self)
             exit_action.triggered.connect(self.close)
-            file_menu.addAction(exit_action)
+            game_menu.addAction(exit_action)
 
             self.calculate_button = None
-            start_action = QAction("开始监控(&S)", self)
+            start_action = QAction("开始(&S)", self)
             start_action.setStatusTip("开始或停止屏幕监控。")
             start_action.triggered.connect(self.toggle_helper)
             self.start_button = start_action
@@ -1545,17 +1582,6 @@ def launch_gui():
             reload_action.setStatusTip("重新读取设置和校准数据。")
             reload_action.triggered.connect(self.reload_helper)
             self.reload_button = reload_action
-
-            game_menu = menu_bar.addMenu("分析(&A)")
-            import_record_action = QAction("导入棋谱(&I)", self)
-            import_record_action.triggered.connect(self.import_game_record)
-            game_menu.addAction(import_record_action)
-            setup_record_action = QAction("摆谱(&S)", self)
-            setup_record_action.triggered.connect(self.start_position_setup_mode)
-            game_menu.addAction(setup_record_action)
-            library_action = QAction("棋谱库(&L)", self)
-            library_action.triggered.connect(self.start_library_mode)
-            game_menu.addAction(library_action)
 
             options_menu = menu_bar.addMenu("连线(&L)")
             options_menu.addAction(start_action)
@@ -1896,7 +1922,7 @@ def launch_gui():
             self.nav_last_button.setEnabled(can_go_forward)
 
         def navigation_text(self):
-            lines = ["棋谱导航", ""]
+            lines = []
             total = max(0, len(self.history_fens) - 1)
             lines.append(f"当前步数：{self.history_index} / {total}")
             lines.append(f"当前走棋：{'红方' if self.game_side == 'red' else '黑方'}")
@@ -1912,8 +1938,10 @@ def launch_gui():
                 auto_sides.append("黑方")
             lines.append(f"电脑走棋：{('、'.join(auto_sides) if auto_sides else '未开启')}    {search_value}")
             lines.append("")
-            lines.append("历史步：")
-            if not self.history_moves:
+            lines.append("记录：")
+            if self.online_record_text:
+                lines.extend(self.online_record_text.splitlines())
+            elif not self.history_moves:
                 lines.append("还没有走法。")
             else:
                 for round_index in range(0, len(self.history_moves), 2):
@@ -1976,6 +2004,11 @@ def launch_gui():
         def hide_settings_dialog(self):
             self.settings_dialog.hide()
 
+        def save_settings_and_close(self):
+            self.save_settings(silent=True)
+            self.settings_dialog.hide()
+            self.set_status("设置已保存")
+
         def mode_single_calculation(self):
             self.auto_move_checkbox.setChecked(False)
             self.save_settings(silent=True)
@@ -2037,10 +2070,16 @@ def launch_gui():
             self.calculate_local_position("训练模式：先看提示，想好后再走")
 
         def start_position_setup_mode(self):
+            self.load_empty_board()
+            self.game_mode = "setup"
+            self.show_navigation_panel()
+            self.set_status("摆谱：空棋盘，右键格子添加或清空棋子")
+
+        def start_new_board_mode(self):
             self.load_game_from_fen(START_FEN)
             self.game_mode = "setup"
             self.show_navigation_panel()
-            self.set_status("摆谱：已载入初始棋盘，可点击棋子走子")
+            self.set_status("新棋盘：已载入初始棋盘，可点击棋子走子")
 
         def import_game_record(self):
             path, _ = QFileDialog.getOpenFileName(
@@ -2075,13 +2114,47 @@ def launch_gui():
             except Exception as e:
                 self.set_status(f"导入棋谱失败：{e}")
 
+        def save_game_record(self):
+            if self.app_worker is not None:
+                path = self.app_worker.save_current_record("manual")
+            else:
+                helper = App.__new__(App)
+                helper.record_saved = False
+                helper.record_moves = []
+                helper.record_start_fen = None
+                helper.history_moves = self.history_moves
+                helper.history_fens = self.history_fens
+                path = App.save_current_record(helper, "manual")
+            if path:
+                self.set_status(f"棋谱已保存：{path}")
+            else:
+                self.set_status("没有可保存的棋谱")
+
+        def import_fen_position(self):
+            text, ok = QInputDialog.getText(
+                self,
+                "导入 FEN",
+                "请输入 FEN：",
+                text=self.current_fen or START_FEN,
+            )
+            if not ok:
+                return
+            fen = text.strip()
+            if not fen:
+                self.set_status("FEN 不能为空")
+                return
+            try:
+                validate_fen(fen)
+                self.load_game_from_fen(fen)
+                self.game_mode = "setup"
+                self.show_navigation_panel()
+                self.set_status("已导入 FEN")
+            except Exception as e:
+                self.set_status(f"导入 FEN 失败：{e}")
+
         def start_pgn_mode(self):
             self.show_text_dialog("PGN 复盘", "PGN 导入和前后步复盘会作为下一步继续移植。")
             self.set_status("PGN 复盘模式待继续移植")
-
-        def start_library_mode(self):
-            self.show_text_dialog("棋谱库", "棋谱库需要本地保存、搜索和导入 PGN，后续继续移植。")
-            self.set_status("棋谱库模式待继续移植")
 
         def start_online_mode(self):
             self.show_text_dialog("在线对弈", "在线对弈需要服务器登录、房间和匹配系统，后续继续移植。")
@@ -2108,6 +2181,23 @@ def launch_gui():
             if self.side_panel.isVisible() and self.side_panel_title.text() == "开局库":
                 self.load_opening_book_panel()
 
+        def load_empty_board(self):
+            self.game_board = [[""] * 9 for _ in range(10)]
+            self.game_side = "red"
+            self.current_fen = board_to_fen(self.game_board, self.game_side)
+            self.current_grid = [row[:] for row in self.game_board]
+            self.current_move = ""
+            self.selected_square = None
+            self.legal_target_moves = {}
+            self.move_history = []
+            self.history_fens = [self.current_fen]
+            self.history_moves = []
+            self.history_index = 0
+            self.update_board_display(self.current_grid)
+            self.refresh_navigation_buttons()
+            if self.side_panel.isVisible() and self.side_panel_title.text() == "导航":
+                self.side_panel_text.setPlainText(self.navigation_text())
+
         def display_square(self, row, col):
             if self.board_flipped:
                 return 9 - row, 8 - col
@@ -2128,6 +2218,9 @@ def launch_gui():
             if square is None:
                 return
             row, col = square
+            if event.button() == Qt.RightButton and self.game_mode == "setup":
+                self.show_piece_menu(row, col, event.globalPos())
+                return
             if self.selected_square is None:
                 self.select_game_square(row, col)
                 return
@@ -2136,6 +2229,41 @@ def launch_gui():
                 self.play_local_move(move)
                 return
             self.select_game_square(row, col)
+
+        def show_piece_menu(self, row, col, global_pos):
+            menu = QMenu(self)
+            piece_groups = [
+                ("红方", [("帅", "K"), ("仕", "A"), ("相", "B"), ("马", "N"), ("车", "R"), ("炮", "C"), ("兵", "P")]),
+                ("黑方", [("将", "k"), ("士", "a"), ("象", "b"), ("马", "n"), ("车", "r"), ("炮", "c"), ("卒", "p")]),
+            ]
+            for group_name, pieces in piece_groups:
+                submenu = menu.addMenu(group_name)
+                for label, piece in pieces:
+                    action = submenu.addAction(label)
+                    action.triggered.connect(lambda _checked=False, p=piece: self.set_setup_piece(row, col, p))
+            menu.addSeparator()
+            clear_action = menu.addAction("清空")
+            clear_action.triggered.connect(lambda _checked=False: self.set_setup_piece(row, col, ""))
+            menu.exec_(global_pos)
+
+        def set_setup_piece(self, row, col, piece):
+            if self.game_board is None:
+                return
+            self.game_board[row][col] = piece
+            self.current_grid = [line[:] for line in self.game_board]
+            self.current_fen = board_to_fen(self.game_board, self.game_side)
+            self.current_move = ""
+            self.selected_square = None
+            self.legal_target_moves = {}
+            self.history_fens = [self.current_fen]
+            self.history_moves = []
+            self.history_index = 0
+            self.update_board_display(self.current_grid)
+            self.refresh_navigation_buttons()
+            if self.side_panel.isVisible() and self.side_panel_title.text() == "导航":
+                self.side_panel_text.setPlainText(self.navigation_text())
+            text = "已清空" if not piece else f"已添加：{self.PIECE_LABELS.get(piece, piece)}"
+            self.set_status(text)
 
         def board_square_from_pos(self, x, y):
             if not self.board_draw_rect:
@@ -2156,7 +2284,10 @@ def launch_gui():
                 self.legal_target_moves = {}
                 self.update_board_display(self.current_grid)
                 return
-            moves = legal_moves_for_piece(self.game_board, row, col)
+            try:
+                moves = legal_moves_for_piece(self.game_board, row, col)
+            except Exception:
+                moves = []
             self.selected_square = (row, col)
             self.legal_target_moves = {
                 uci_to_coords(move)[2:4]: move
@@ -2301,6 +2432,11 @@ def launch_gui():
             if self.analysis_dialog.isVisible():
                 self.analysis_box.setPlainText(self.analysis_text)
 
+        def update_record_display(self, text):
+            self.online_record_text = text or ""
+            if self.side_panel.isVisible() and self.side_panel_title.text() == "导航":
+                self.side_panel_text.setPlainText(self.navigation_text())
+
         def copy_fen(self):
             if not self.current_fen:
                 self.set_status("还没有可复制的 FEN，请先计算或开始识别。")
@@ -2328,7 +2464,7 @@ def launch_gui():
             self.show_text_dialog(
                 "使用提示",
                 "1. 第一次使用先打开 连线 -> 设置 -> 校准棋盘。\n"
-                "2. 想持续跟随屏幕棋盘，点 连线 -> 开始监控。\n"
+                "2. 想持续跟随屏幕棋盘，点 连线 -> 开始。\n"
                 "3. 计算时会显示实时分数和候选走法。\n"
                 "4. 自动走棋建议确认识别稳定以后再开启。",
             )
@@ -2502,6 +2638,12 @@ def launch_gui():
                 return value.strip().lower() in ("1", "true", "yes", "on")
             return bool(value)
 
+        def config_int(self, config, key, default=0):
+            try:
+                return int(float(config.get(key, default)))
+            except (TypeError, ValueError):
+                return int(default)
+
         def load_settings(self):
             config = load_config()
             self.min_time_spin.setValue(
@@ -2513,14 +2655,11 @@ def launch_gui():
             self.auto_move_checkbox.setChecked(
                 self.config_bool(config, "auto_move", True)
             )
-            self.turn_indicator_checkbox.setChecked(
-                self.config_bool(config, "online_use_avatar_turn_indicator", False)
+            self.engine_threads_spin.setValue(
+                self.config_int(config, "engine_threads", 1)
             )
             self.auto_next_checkbox.setChecked(
                 self.config_bool(config, "auto_start_next_game", False)
-            )
-            self.active_next_scan_checkbox.setChecked(
-                self.config_bool(config, "next_game_fullscreen_scan", True)
             )
 
         def save_settings(self, silent=False):
@@ -2534,11 +2673,10 @@ def launch_gui():
                 update_config({
                     "auto_move_search_time_min": round(min_sec, 2),
                     "auto_move_search_time_max": round(max_sec, 2),
+                    "engine_threads": self.engine_threads_spin.value(),
                     "auto_move": self.auto_move_checkbox.isChecked(),
-                    "auto_turn_indicator": self.turn_indicator_checkbox.isChecked(),
-                    "online_use_avatar_turn_indicator": self.turn_indicator_checkbox.isChecked(),
                     "auto_start_next_game": self.auto_next_checkbox.isChecked(),
-                    "next_game_fullscreen_scan": self.active_next_scan_checkbox.isChecked(),
+                    "next_game_fullscreen_scan": True,
                 })
             except Exception as e:
                 self.set_status(f"设置保存失败：{e}")
@@ -2568,12 +2706,13 @@ def launch_gui():
                 return
             if not calibration_exists():
                 self.set_status("缺少 config.json，请先点击“校准棋盘”。")
-                self.start_button.setText("开始监控(&S)")
+                self.start_button.setText("开始(&S)")
                 self.start_button.setEnabled(True)
                 return
 
-            self.start_button.setText("停止监控(&S)")
+            self.start_button.setText("停止(&S)")
             self.set_status("正在启动...")
+            self.update_record_display("")
             self.worker_thread = threading.Thread(target=self.run_worker, daemon=True)
             self.worker_thread.start()
 
@@ -2594,6 +2733,7 @@ def launch_gui():
                     move_callback=self.signals.move.emit,
                     fen_callback=self.signals.fen.emit,
                     analysis_callback=self.signals.analysis.emit,
+                    record_callback=self.signals.record.emit,
                 )
                 if self.closing:
                     self.app_worker.stop()
@@ -2661,6 +2801,7 @@ def launch_gui():
                     move_callback=self.signals.move.emit,
                     fen_callback=self.signals.fen.emit,
                     analysis_callback=self.signals.analysis.emit,
+                    record_callback=self.signals.record.emit,
                     enable_mouse=False,
                 )
                 if self.closing:
@@ -2691,24 +2832,10 @@ def launch_gui():
             if self.recognize_thread and self.recognize_thread.is_alive():
                 self.set_status("识别窗口已经打开")
                 return
-            self.recognize_turn_button.setEnabled(False)
             self.recognize_next_button.setEnabled(False)
             self.set_status("正在打开下一局按钮识别窗口...")
             self.recognize_thread = threading.Thread(
                 target=self.run_next_game_recognition,
-                daemon=True,
-            )
-            self.recognize_thread.start()
-
-        def recognize_turn_indicator(self):
-            if self.recognize_thread and self.recognize_thread.is_alive():
-                self.set_status("识别窗口已经打开")
-                return
-            self.recognize_turn_button.setEnabled(False)
-            self.recognize_next_button.setEnabled(False)
-            self.set_status("正在打开头像识别窗口...")
-            self.recognize_thread = threading.Thread(
-                target=self.run_turn_indicator_recognition,
                 daemon=True,
             )
             self.recognize_thread.start()
@@ -2751,33 +2878,11 @@ def launch_gui():
             finally:
                 self.signals.recognition_done.emit()
 
-        def run_turn_indicator_recognition(self):
-            try:
-                if self.app_worker is not None:
-                    self.app_worker.stop()
-                if self.worker_thread is not None and self.worker_thread.is_alive():
-                    self.worker_thread.join(timeout=3.0)
-
-                result = subprocess.run(
-                    _turn_indicator_recognition_command(),
-                    cwd=_app_dir(),
-                    check=False,
-                )
-                if result.returncode == 0:
-                    self.signals.status.emit("头像位置已保存")
-                else:
-                    self.signals.status.emit(f"识别窗口已关闭：{result.returncode}")
-            except Exception as e:
-                self.signals.status.emit(f"识别失败：{e}")
-            finally:
-                self.signals.recognition_done.emit()
-
         def on_calibration_done(self):
             self.calibrate_button.setEnabled(True)
             self.load_settings()
 
         def on_recognition_done(self):
-            self.recognize_turn_button.setEnabled(True)
             self.recognize_next_button.setEnabled(True)
             self.load_settings()
 
@@ -2787,7 +2892,7 @@ def launch_gui():
 
         def on_stopped(self):
             self.start_button.setEnabled(True)
-            self.start_button.setText("开始监控(&S)")
+            self.start_button.setText("开始(&S)")
             if not self.status.text().startswith("错误："):
                 self.set_status("已停止")
 
@@ -2833,17 +2938,11 @@ def run_recognize_next_mode():
     run_next_game_recognition(prompt="--no-prompt" not in sys.argv)
 
 
-def run_recognize_turn_mode():
-    run_turn_indicator_recognition(prompt="--no-prompt" not in sys.argv)
-
-
 def main():
     if "--calibrate" in sys.argv:
         run_calibrate_mode()
     elif "--recognize-next" in sys.argv:
         run_recognize_next_mode()
-    elif "--recognize-turn" in sys.argv:
-        run_recognize_turn_mode()
     elif "--cli" in sys.argv:
         run_cli()
     else:
