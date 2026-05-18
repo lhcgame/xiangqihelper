@@ -259,9 +259,13 @@ class Engine:
         
         self.bestmove = None
         self.eval_score = ""
+        self.current_depth = 0
         self.current_pv_move = None
+        self.current_pv_line = []
         # multipv index (1..N) -> first move of that line, in engine coords
         self.pv_moves = {}
+        self.pv_lines = {}
+        self.pv_scores = {}
         self._ready_event = threading.Event()
 
         # Start a thread to read engine output continuously
@@ -302,34 +306,46 @@ class Engine:
                         self.bestmove = parts[1]
                         
                 if line.startswith("info"):
+                    parts = line.split()
+                    mpv_idx = 1
+                    if "multipv" in parts:
+                        try:
+                            mpv_idx = int(parts[parts.index("multipv") + 1])
+                        except (ValueError, IndexError):
+                            mpv_idx = 1
+
+                    if "depth" in parts:
+                        try:
+                            depth = int(parts[parts.index("depth") + 1])
+                            if mpv_idx == 1:
+                                self.current_depth = depth
+                        except (ValueError, IndexError):
+                            pass
+
                     # Extract score if present
                     if "score" in line:
-                        parts = line.split()
                         try:
                             idx = parts.index("score")
                             if idx + 2 < len(parts):
-                                self.eval_score = f"{parts[idx+1]} {parts[idx+2]}"
+                                score = f"{parts[idx+1]} {parts[idx+2]}"
+                                self.pv_scores[mpv_idx] = score
+                                if mpv_idx == 1:
+                                    self.eval_score = score
                         except ValueError:
                             pass
                             
                     # Extract PV (Principal Variation) best move so far
                     if " pv " in line:
                         pv_str = line.split(" pv ")[1]
-                        pv_first = pv_str.split()[0] if pv_str.split() else None
-
-                        # Per-line MultiPV index (defaults to 1 when absent).
-                        mpv_idx = 1
-                        if " multipv " in line:
-                            try:
-                                tokens = line.split()
-                                mpv_idx = int(tokens[tokens.index("multipv") + 1])
-                            except (ValueError, IndexError):
-                                mpv_idx = 1
+                        pv_line = pv_str.split()
+                        pv_first = pv_line[0] if pv_line else None
 
                         if pv_first:
                             self.pv_moves[mpv_idx] = pv_first
+                            self.pv_lines[mpv_idx] = pv_line[:8]
                             if mpv_idx == 1:
                                 self.current_pv_move = pv_first
+                                self.current_pv_line = pv_line[:8]
             except Exception as e:
                 print(f"\n[Engine Reader Error] {e}")
 
@@ -366,8 +382,13 @@ class Engine:
             raise InterruptedError("Engine search cancelled")
 
         self.bestmove = None
+        self.eval_score = ""
+        self.current_depth = 0
         self.current_pv_move = None
+        self.current_pv_line = []
         self.pv_moves = {}
+        self.pv_lines = {}
+        self.pv_scores = {}
         self.send_cmd("ucinewgame")
         self.wait_for_ready(should_cancel=should_cancel)
 

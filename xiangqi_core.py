@@ -23,6 +23,26 @@ PIECE_NAMES = {
     "p": "Black Pawn",
 }
 
+CHINESE_PIECE_NAMES = {
+    "K": "帅",
+    "A": "仕",
+    "B": "相",
+    "N": "马",
+    "R": "车",
+    "C": "炮",
+    "P": "兵",
+    "k": "将",
+    "a": "士",
+    "b": "象",
+    "n": "马",
+    "r": "车",
+    "c": "炮",
+    "p": "卒",
+}
+
+RED_NUMERALS = "一二三四五六七八九"
+BLACK_NUMERALS = "１２３４５６７８９"
+
 MAX_PIECES = {
     "K": 1, "A": 2, "B": 2, "N": 2, "R": 2, "C": 2, "P": 5,
     "k": 1, "a": 2, "b": 2, "n": 2, "r": 2, "c": 2, "p": 5,
@@ -128,6 +148,55 @@ def uci_to_coords(move):
 
 def coords_to_uci(src_row, src_col, dst_row, dst_col):
     return f"{FILES[src_col]}{9 - src_row}{FILES[dst_col]}{9 - dst_row}"
+
+
+def chinese_file_number(side, col):
+    index = 8 - col if side == "red" else col
+    numerals = RED_NUMERALS if side == "red" else BLACK_NUMERALS
+    return numerals[index]
+
+
+def chinese_step_number(side, steps):
+    numerals = RED_NUMERALS if side == "red" else BLACK_NUMERALS
+    return numerals[max(0, min(8, steps - 1))]
+
+
+def move_to_chinese(board, move):
+    src_row, src_col, dst_row, dst_col = uci_to_coords(move)
+    piece = board[src_row][src_col]
+    if not piece:
+        return normalize_uci(move)
+
+    side = piece_side(piece)
+    name = CHINESE_PIECE_NAMES.get(piece, piece)
+    start_file = chinese_file_number(side, src_col)
+    forward = dst_row < src_row if side == "red" else dst_row > src_row
+    action = "平"
+    target = chinese_file_number(side, dst_col)
+
+    if dst_col != src_col:
+        action = "进" if forward else "退"
+        target = chinese_file_number(side, dst_col)
+    elif dst_row != src_row:
+        action = "进" if forward else "退"
+        target = chinese_step_number(side, abs(dst_row - src_row))
+
+    return f"{name}{start_file}{action}{target}"
+
+
+def move_line_to_chinese(board, moves):
+    display_moves = []
+    current_board = clone_board(board)
+    current_side = piece_side(current_board[uci_to_coords(moves[0])[0]][uci_to_coords(moves[0])[1]]) if moves else None
+    for move in moves:
+        try:
+            display_moves.append(move_to_chinese(current_board, move))
+            side = piece_side(current_board[uci_to_coords(move)[0]][uci_to_coords(move)[1]]) or current_side
+            current_board = apply_uci(current_board, move)
+            current_side = opponent(side) if side else None
+        except Exception:
+            display_moves.append(move)
+    return display_moves
 
 
 def normalize_uci(token):

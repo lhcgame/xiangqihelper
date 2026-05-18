@@ -1,7 +1,9 @@
 import os
+import pathlib
 import sys
 import time
 import signal
+import sqlite3
 import subprocess
 import threading
 import random
@@ -50,8 +52,21 @@ from calibrate import run_next_game_recognition
 from calibrate import run_turn_indicator_recognition
 from calibrate import run_calibration as run_calibration_flow
 from calibrate import update_config
-from app_paths import candidate_paths
+from app_paths import candidate_paths, resolve_resource_path
 from xiangqi_core import (
+    START_FEN,
+    apply_uci_to_fen,
+    apply_uci,
+    board_to_fen,
+    coords_to_uci,
+    fen_to_board,
+    is_legal_move,
+    legal_moves,
+    legal_moves_for_piece,
+    move_to_chinese,
+    opponent,
+    parse_pgn,
+    piece_side,
     validate_fen,
     uci_to_coords,
 )
@@ -141,7 +156,20 @@ def _turn_indicator_recognition_command():
 
 
 class App:
-    def __init__(self, exit_on_error=True, hide_dock_icon=True):
+    def __init__(
+        self,
+        exit_on_error=True,
+        hide_dock_icon=True,
+        board_callback=None,
+        move_callback=None,
+        fen_callback=None,
+        analysis_callback=None,
+        enable_mouse=True,
+    ):
+        self.board_callback = board_callback
+        self.move_callback = move_callback
+        self.fen_callback = fen_callback
+        self.analysis_callback = analysis_callback
         try:
             self.vis = Vision()
         except Exception as e:
@@ -168,8 +196,16 @@ class App:
         self.next_game_last_click_at = 0.0
         self.next_game_last_scan_at = 0.0
         self.waiting_for_new_game = False
+        self.manual_result_hold_until = 0.0
         self.turn_indicator_last_ratio = None
         self.turn_indicator_missing_logged_at = 0.0
+        self.board_change_initialized = False
+        self.board_change_baseline_key = None
+        self.board_change_baseline_fen = None
+        self.board_change_baseline_piece_count = 0
+        self.board_change_invalid_key = None
+        self.board_change_invalid_count = 0
+        self.board_change_strict_baseline = False
         self._next_game_template = None
         self._next_game_template_path = None
         self._next_game_template_mtime = None
@@ -177,24 +213,34 @@ class App:
         self._recalc = threading.Event()
         self._reset_requested = threading.Event()
         self._reload_requested = threading.Event()
+        self._manual_calculate_requested = threading.Event()
         self._stop_requested = threading.Event()
-        self._mouse_available = True
-        try:
-            _load_mouse_controls(hide_dock_icon=hide_dock_icon)
-            self._mouse = MouseController()
-        except Exception as e:
-            if self._config_bool("auto_move", default=True):
-                raise RuntimeError(
-                    "Mouse control is unavailable. On Linux, run under an X11 session "
-                    "or set auto_move to false in config.json."
-                ) from e
-            self._mouse_available = False
-            self._mouse = _NoMouseController()
-            print(f"[Mouse] unavailable; continuing without auto move: {e}")
+        self._mouse_available = False
+        self._mouse = _NoMouseController()
+        if enable_mouse:
+            try:
+                _load_mouse_controls(hide_dock_icon=hide_dock_icon)
+                self._mouse = MouseController()
+                self._mouse_available = True
+            except Exception as e:
+                if self._config_bool("auto_move", default=True):
+                    raise RuntimeError(
+                        "Mouse control is unavailable. On Linux, run under an X11 session "
+                        "or set auto_move to false in config.json."
+                    ) from e
+                print(f"[Mouse] unavailable; continuing without auto move: {e}")
 
     def request_reload(self):
         self._reload_requested.set()
         self._reset_requested.set()
+
+    def request_calculate(self):
+        self._manual_calculate_requested.set()
+        self._reset_requested.set()
+        try:
+            self.eng.send_cmd("stop")
+        except Exception:
+            pass
 
     def stop(self):
         self._stop_requested.set()
@@ -205,7 +251,11 @@ class App:
             pass
 
     def _should_cancel_search(self):
-        return self._reset_requested.is_set() or self._stop_requested.is_set()
+        return (
+            self._reset_requested.is_set()
+            or self._manual_calculate_requested.is_set()
+            or self._stop_requested.is_set()
+        )
 
     def _reload(self):
         self.vis = Vision()
@@ -224,7 +274,92 @@ class App:
         self.turn_action_done = False
         self.turn_inactive_count = 0
         self.waiting_for_new_game = False
+        self.manual_result_hold_until = 0.0
         self.turn_indicator_last_ratio = None
+        self.board_change_initialized = False
+        self.board_change_baseline_key = None
+        self.board_change_baseline_fen = None
+        self.board_change_baseline_piece_count = 0
+        self.board_change_invalid_key = None
+        self.board_change_invalid_count = 0
+        self.board_change_strict_baseline = False
+
+    def _emit_move(self, move, label="PV"):
+        if self.move_callback is not None:
+            self.move_callback(move, label)
+
+    def _emit_analysis(self, text):
+        if self.analysis_callback is not None:
+            self.analysis_callback(text)
+
+    def _format_engine_analysis(self, fen=None, flipped=False):
+        lines = []
+        depth = getattr(self.eng, "current_depth", 0)
+        score = getattr(self.eng, "eval_score", "")
+        if depth or score:
+            lines.append(f"深度：{depth or '-'}    分数：{self._format_eval_score(score)}")
+
+        pv_line = getattr(self.eng, "current_pv_line", []) or []
+        if pv_line and self._is_engine_move_legal_for_fen(fen, pv_line[0]):
+            lines.append("主线：" + " ".join(self._format_move_line(pv_line, fen, flipped)))
+
+        pv_lines = getattr(self.eng, "pv_lines", {}) or {}
+        if pv_lines:
+            lines.append("")
+            lines.append("候选走法：")
+            for rank in sorted(pv_lines)[:5]:
+                moves = pv_lines.get(rank) or []
+                if not moves:
+                    continue
+                if not self._is_engine_move_legal_for_fen(fen, moves[0]):
+                    continue
+                score_text = self._format_eval_score((getattr(self.eng, "pv_scores", {}) or {}).get(rank, ""))
+                gui_moves = self._format_move_line(moves[:5], fen, flipped)
+                lines.append(f"{rank}. {gui_moves[0]}    {score_text}    {' '.join(gui_moves)}")
+
+        return "\n".join(lines) if lines else "正在等待引擎分析..."
+
+    def _is_engine_move_legal_for_fen(self, fen, move):
+        if not fen or not move:
+            return False
+        try:
+            board, side = fen_to_board(fen)
+            return is_legal_move(board, side, move)
+        except Exception:
+            return False
+
+    def _format_move_line(self, moves, fen=None, flipped=False):
+        if not fen:
+            return [flip_move(move) if flipped else move for move in moves]
+        try:
+            board, _ = fen_to_board(fen)
+        except Exception:
+            return [flip_move(move) if flipped else move for move in moves]
+        current_board = [row[:] for row in board]
+        display_moves = []
+        for move in moves:
+            try:
+                display_moves.append(move_to_chinese(current_board, move))
+                current_board = apply_uci(current_board, move)
+            except Exception:
+                display_moves.append(flip_move(move) if flipped else move)
+        return display_moves
+
+    def _format_eval_score(self, score):
+        if not score:
+            return "-"
+        parts = str(score).split()
+        if len(parts) != 2:
+            return str(score)
+        kind, value = parts
+        if kind == "cp":
+            try:
+                return f"{int(value) / 100:+.2f}"
+            except ValueError:
+                return score
+        if kind == "mate":
+            return f"杀棋 {value}"
+        return score
 
     def _config_bool(self, key, default=False):
         value = getattr(self.vis, "config", {}).get(key, default)
@@ -510,6 +645,67 @@ class App:
             return True
         return ratio <= previous - drop
 
+    def _use_avatar_turn_indicator(self):
+        return self._config_bool("online_use_avatar_turn_indicator", default=False)
+
+    def _fen_board_key(self, fen):
+        return fen.strip().split()[0] if fen else ""
+
+    def _is_initial_board_key(self, board_key):
+        return board_key == self._fen_board_key(START_FEN)
+
+    def _screen_player_side(self, flipped):
+        return "black" if flipped else "red"
+
+    def _piece_count_from_board_key(self, board_key):
+        return sum(1 for ch in board_key if ch.isalpha())
+
+    def _set_board_change_baseline(self, fen):
+        key = self._fen_board_key(fen)
+        self.board_change_baseline_fen = fen
+        self.board_change_baseline_key = key
+        self.board_change_baseline_piece_count = self._piece_count_from_board_key(key)
+        self.board_change_initialized = True
+        self.board_change_invalid_key = None
+        self.board_change_invalid_count = 0
+        self.board_change_strict_baseline = False
+
+    def _set_expected_own_move_baseline(self, fen):
+        self._set_board_change_baseline(fen)
+        self.board_change_strict_baseline = True
+
+    def _is_legal_next_board_key(self, current_key):
+        if not self.board_change_baseline_fen:
+            return True
+        try:
+            board, baseline_side = fen_to_board(self.board_change_baseline_fen)
+            for side in (baseline_side, opponent(baseline_side)):
+                for move in legal_moves(board, side):
+                    next_board = apply_uci(board, move)
+                    if self._fen_board_key(board_to_fen(next_board, opponent(side))) == current_key:
+                        return True
+        except Exception as e:
+            dprint(f"[Board change validation skipped] {e}")
+            return True
+        return False
+
+    def _invalid_board_recovered(self, fen, current_key, min_stable):
+        if self.board_change_invalid_key == current_key:
+            self.board_change_invalid_count += 1
+        else:
+            self.board_change_invalid_key = current_key
+            self.board_change_invalid_count = 1
+
+        recover_frames = max(
+            min_stable * 4,
+            self._config_int("board_change_invalid_recover_frames", 12),
+        )
+        if self.stable_count >= min_stable and self.board_change_invalid_count >= recover_frames:
+            self._set_board_change_baseline(fen)
+            self._print_status_once("异常棋盘已稳定，重新等待对方走棋...")
+            return True
+        return False
+
     def _stable_frame_count_needed(self):
         return max(
             1,
@@ -561,6 +757,10 @@ class App:
             return None
 
         self._update_stability(fen)
+        if self.board_callback is not None:
+            self.board_callback([row[:] for row in grid])
+        if self.fen_callback is not None:
+            self.fen_callback(fen)
         return fen, grid, flipped
 
     def _board_cell_screen_pos(self, row, col):
@@ -609,15 +809,27 @@ class App:
                 float(self.vis.config["auto_move_mouse_away_y"]),
             )
 
-        x_offset = float(self.vis.config.get("auto_move_mouse_away_offset_x", 80.0))
-        y_offset = float(self.vis.config.get("auto_move_mouse_away_offset_y", 80.0))
+        if sys.platform == "win32":
+            try:
+                import ctypes
+
+                user32 = ctypes.windll.user32
+                virtual_left = user32.GetSystemMetrics(76)
+                virtual_top = user32.GetSystemMetrics(77)
+                virtual_width = user32.GetSystemMetrics(78)
+                virtual_height = user32.GetSystemMetrics(79)
+                return (
+                    virtual_left + virtual_width / 2,
+                    virtual_top + virtual_height - 2,
+                )
+            except Exception:
+                pass
+
         return (
-            float(self.vis.config["bottom_right_x"])
-            + float(self.vis.config.get("screen_left", 0))
-            + x_offset,
-            float(self.vis.config["bottom_right_y"])
-            + float(self.vis.config.get("screen_top", 0))
-            + y_offset,
+            float(self.vis.config.get("screen_left", 0)) + 20.0,
+            float(self.vis.config.get("screen_top", 0))
+            + float(self.vis.config.get("screen_height", 1080))
+            - 2.0,
         )
 
     def _auto_move(self, fen, gui_move):
@@ -714,6 +926,23 @@ class App:
         finally:
             self.eng.quit()
 
+    def calculate_current_board(self):
+        try:
+            img = capture_screen(self.vis.config)
+        except Exception as e:
+            dprint(f"[Screen capture failed] {e}")
+            self.vis.invalidate_homography()
+            return False
+
+        position = self._read_board_position(img)
+        if position is None:
+            dprint("No readable board found.")
+            return False
+
+        fen, _, flipped = position
+        self._emit_move("", "")
+        return self._calculate_and_print(fen, flipped, allow_auto_move=False)
+
     def _tick(self):
         if self._stop_requested.is_set():
             return
@@ -749,8 +978,25 @@ class App:
             if position is None:
                 if self.waiting_for_new_game:
                     self._print_status_once("Waiting for new game board...")
+                elif self._manual_calculate_requested.is_set():
+                    self._manual_calculate_requested.clear()
+                    self._print_status_once("No readable board found.")
                 return
             fen, _, flipped = position
+            manual_calculate = self._manual_calculate_requested.is_set()
+
+            if manual_calculate:
+                self._manual_calculate_requested.clear()
+                self._recalc.clear()
+                self._emit_move("", "")
+                moved_or_reported = self._calculate_and_print(
+                    fen,
+                    flipped,
+                    allow_auto_move=False,
+                )
+                if moved_or_reported:
+                    self.manual_result_hold_until = time.time() + 8.0
+                return
 
             min_stable = self._stable_frame_count_needed()
             if self.waiting_for_new_game:
@@ -763,7 +1009,81 @@ class App:
                 self.waiting_for_new_game = False
                 self._print_status_once("New game ready; waiting for my turn...")
 
+            if not self._use_avatar_turn_indicator():
+                force = self._recalc.is_set()
+                current_key = self._fen_board_key(fen)
+                if not self.board_change_initialized:
+                    if self._screen_player_side(flipped) == "red":
+                        if self.stable_count < min_stable:
+                            self._print_status_once(
+                                f"识别到我方红方，等待棋盘稳定 {self.stable_count}/{min_stable}..."
+                            )
+                            return
+                        self._recalc.clear()
+                        moved_or_reported = self._calculate_and_print(fen, flipped)
+                        if moved_or_reported:
+                            self.turn_action_done = True
+                        return
+                    self._set_board_change_baseline(fen)
+                    if self._is_initial_board_key(current_key):
+                        self._print_status_once("对方红方先走，等待红方走棋...")
+                    else:
+                        self._print_status_once("等待对方走棋...")
+                    return
+
+                if not force and current_key == self.board_change_baseline_key:
+                    if self._is_initial_board_key(current_key) and self._screen_player_side(flipped) == "black":
+                        self._print_status_once("对方红方先走，等待红方走棋...")
+                    else:
+                        self._print_status_once("等待对方走棋...")
+                    return
+
+                current_piece_count = self._piece_count_from_board_key(current_key)
+                if (
+                    self.board_change_baseline_piece_count
+                    and current_piece_count < self.board_change_baseline_piece_count - 1
+                ):
+                    if (
+                        not self.board_change_strict_baseline
+                        and self._invalid_board_recovered(fen, current_key, min_stable)
+                    ):
+                        return
+                    self._print_status_once(
+                        f"棋子数量异常，等待棋盘恢复 {current_piece_count}/{self.board_change_baseline_piece_count}..."
+                    )
+                    return
+
+                if not force and not self._is_legal_next_board_key(current_key):
+                    if (
+                        not self.board_change_strict_baseline
+                        and self._invalid_board_recovered(fen, current_key, min_stable)
+                    ):
+                        return
+                    if self.board_change_strict_baseline:
+                        self._print_status_once("等待对方走出下一步合法棋...")
+                    else:
+                        self._print_status_once("棋盘变化不是一步合法棋，等待识别恢复...")
+                    return
+
+                self.board_change_invalid_key = None
+                self.board_change_invalid_count = 0
+                self.board_change_strict_baseline = False
+
+                if self.stable_count < min_stable:
+                    self._print_status_once(
+                        f"对方已走棋，等待棋盘稳定 {self.stable_count}/{min_stable}..."
+                    )
+                    return
+
+                self._recalc.clear()
+                moved_or_reported = self._calculate_and_print(fen, flipped)
+                if moved_or_reported:
+                    self.turn_action_done = True
+                return
+
             if not self._own_turn_indicator_active(img):
+                if time.time() < self.manual_result_hold_until:
+                    return
                 if self.last_turn_active:
                     self.turn_inactive_count += 1
                     needed = self._turn_inactive_frame_count_needed()
@@ -811,7 +1131,7 @@ class App:
                 print(f"Error: {e}")
                 traceback.print_exc()
 
-    def _calculate_and_print(self, fen, flipped):
+    def _calculate_and_print(self, fen, flipped, allow_auto_move=True):
         try:
             validate_fen(fen)
         except ValueError as e:
@@ -856,9 +1176,15 @@ class App:
 
             pv = self.eng.current_pv_move
             if pv:
+                if not self._is_engine_move_legal_for_fen(fen, pv):
+                    time.sleep(0.05)
+                    continue
                 gui_pv = flip_move(pv) if flipped else pv
                 if gui_pv != last_pv:
                     last_pv = gui_pv
+                    self._emit_move(gui_pv, "PV")
+                    print(f"PV: {self._format_move_line([pv], fen, flipped)[0]}")
+            self._emit_analysis(self._format_engine_analysis(fen, flipped))
             time.sleep(0.05)
 
         bm = self.eng.bestmove
@@ -867,10 +1193,19 @@ class App:
             return False
 
         gui_move = flip_move(bm) if flipped else bm
+        self._emit_move(gui_move, "最佳")
+        self._emit_analysis(self._format_engine_analysis(fen, flipped))
         dprint(f"[Best move] engine={bm} gui={gui_move}")
-        print(f"Best move: {gui_move}")
+        print(f"Best move: {self._format_move_line([bm], fen, flipped)[0]}")
         self.last_status = None
-        moved = self._auto_move(fen, gui_move)
+        moved = allow_auto_move and self._auto_move(fen, gui_move)
+        if moved:
+            try:
+                self._set_expected_own_move_baseline(apply_uci_to_fen(fen, bm))
+            except Exception:
+                self._set_expected_own_move_baseline(fen)
+        else:
+            self._set_board_change_baseline(fen)
         if moved:
             self._print_status_once(f"Played {gui_move}; waiting for turn to end...")
         else:
@@ -902,62 +1237,132 @@ def _ensure_cooked_terminal():
 
 
 def launch_gui():
-    from PyQt5.QtCore import QObject, Qt, pyqtSignal
+    from PyQt5.QtCore import QObject, Qt, QTimer, pyqtSignal
+    from PyQt5.QtGui import QBrush, QColor, QFont, QPainter, QPen, QPixmap
     from PyQt5.QtWidgets import (
+        QAction,
         QApplication,
         QCheckBox,
+        QComboBox,
+        QDialog,
         QDoubleSpinBox,
+        QFileDialog,
         QFormLayout,
         QGroupBox,
         QHBoxLayout,
         QLabel,
+        QMainWindow,
+        QMenuBar,
+        QPlainTextEdit,
         QPushButton,
+        QSizePolicy,
+        QSpinBox,
         QVBoxLayout,
         QWidget,
     )
 
     class GuiSignals(QObject):
         status = pyqtSignal(str)
+        board = pyqtSignal(object)
+        move = pyqtSignal(str, str)
+        fen = pyqtSignal(str)
+        analysis = pyqtSignal(str)
+        local_move = pyqtSignal(str)
+        ai_done = pyqtSignal()
         stopped = pyqtSignal()
+        calculation_done = pyqtSignal()
         calibration_done = pyqtSignal()
         recognition_done = pyqtSignal()
 
-    class HelperWindow(QWidget):
+    class HelperWindow(QMainWindow):
+        PIECE_LABELS = {
+            "K": "帅",
+            "A": "仕",
+            "B": "相",
+            "N": "马",
+            "R": "车",
+            "C": "炮",
+            "P": "兵",
+            "k": "将",
+            "a": "士",
+            "b": "象",
+            "n": "马",
+            "r": "车",
+            "c": "炮",
+            "p": "卒",
+        }
+
         def __init__(self):
             super().__init__()
             self.app_worker = None
             self.worker_thread = None
+            self.calculate_thread = None
             self.calibrate_thread = None
             self.recognize_thread = None
             self.closing = False
             self.signals = GuiSignals()
             self.signals.status.connect(self.set_status)
+            self.signals.board.connect(self.update_board_display)
+            self.signals.move.connect(self.update_move_display)
+            self.signals.fen.connect(self.update_fen)
+            self.signals.analysis.connect(self.update_analysis_display)
+            self.signals.local_move.connect(self.apply_ai_move)
+            self.signals.ai_done.connect(self.on_ai_done)
             self.signals.stopped.connect(self.on_stopped)
+            self.signals.calculation_done.connect(self.on_calculation_done)
             self.signals.calibration_done.connect(self.on_calibration_done)
             self.signals.recognition_done.connect(self.on_recognition_done)
 
-            self.setWindowTitle("象棋屏幕助手")
-            self.setMinimumWidth(500)
+            self.setWindowTitle("象棋助手")
+            self.setMinimumWidth(760)
+            self.setMinimumHeight(580)
+            self.resize(820, 580)
+            self.current_grid = None
+            self.current_move = ""
+            self.current_move_label = ""
+            self.current_fen = ""
+            self.analysis_text = "还没有分析结果。"
+            self.settings_dialog = None
+            self.analysis_dialog = None
+            self.text_dialogs = []
+            self.game_mode = "assistant"
+            self.game_board = None
+            self.game_side = "red"
+            self.player_side = "red"
+            self.board_flipped = False
+            self.selected_square = None
+            self.legal_target_moves = {}
+            self.move_history = []
+            self.history_fens = []
+            self.history_moves = []
+            self.history_index = 0
+            self.ai_thread = None
+            self.pending_ai_movetime = 1000
+            self.pending_ai_depth = None
+            self.pending_ai_fen = ""
+            self.board_draw_rect = None
+            self.opening_book_path = self.find_opening_book_path()
 
-            self.title = QLabel("象棋屏幕助手")
-            self.title.setAlignment(Qt.AlignCenter)
-            self.title.setStyleSheet("font-size: 20px; font-weight: 600;")
+            self.board_label = QLabel()
+            self.board_label.setAlignment(Qt.AlignCenter)
+            self.board_label.setMinimumSize(430, 480)
+            self.board_label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+            self.board_label.setToolTip("读取屏幕后，这里会同步显示识别到的棋盘。")
+            self.board_label.mousePressEvent = self.handle_board_click
+            self.board_pixmap = QPixmap(resolve_resource_path("assets/boardchess.jpg"))
+            if self.board_pixmap.isNull():
+                self.board_label.setText("棋盘图片未找到")
+            else:
+                self.update_board_display(None)
 
             self.status = QLabel("已停止")
             self.status.setAlignment(Qt.AlignCenter)
 
-            self.start_button = QPushButton("开始")
-            self.reload_button = QPushButton("重新读取")
-            self.calibrate_button = QPushButton("校准棋盘")
-            self.exit_button = QPushButton("退出")
-            self.start_button.setToolTip("开始识别棋盘；运行中再次点击会停止。")
-            self.reload_button.setToolTip("重新读取 config.json 和校准图片，并重新计算当前局面。")
-            self.calibrate_button.setToolTip("重新选择棋盘位置，并保存棋子识别图片。")
-            self.exit_button.setToolTip("关闭程序，并停止 Pikafish 引擎。")
-
             self.min_time_spin = self.make_seconds_spin(0.1, 60.0)
             self.max_time_spin = self.make_seconds_spin(0.1, 60.0)
-            self.turn_indicator_checkbox = QCheckBox("用头像绿色圈判断轮到我")
+            self.auto_move_checkbox = QCheckBox("自动走棋")
+            self.turn_indicator_checkbox = QCheckBox("旧方式：用头像判断轮到我")
+            self.calibrate_button = QPushButton("校准棋盘")
             self.recognize_turn_button = QPushButton("识别头像位置")
             self.auto_next_checkbox = QCheckBox("自动开始下一局")
             self.active_next_scan_checkbox = QCheckBox("主动寻找下一局按钮")
@@ -965,26 +1370,19 @@ def launch_gui():
             self.save_settings_button = QPushButton("保存设置")
             self.min_time_spin.setToolTip("引擎最少思考几秒。")
             self.max_time_spin.setToolTip("引擎最多思考几秒。")
-            self.turn_indicator_checkbox.setToolTip("开启后，只有看到你头像旁的绿色倒计时圈，程序才会走棋。")
+            self.auto_move_checkbox.setToolTip("勾选后程序会自动点击推荐走法；不勾选时只计算走法，不点鼠标。")
+            self.turn_indicator_checkbox.setToolTip("默认关闭。联机时建议用棋盘变化判断：对方走完棋后，我方自动计算。")
+            self.calibrate_button.setToolTip("重新校准棋盘位置。")
             self.recognize_turn_button.setToolTip("框选你头像旁的绿色倒计时圈，用来判断是不是轮到你。")
             self.auto_next_checkbox.setToolTip("一局结束后，如果识别到下一局按钮，就自动点击进入下一局。")
             self.active_next_scan_checkbox.setToolTip("运行时持续扫描屏幕，尽快发现下一局按钮。")
             self.recognize_next_button.setToolTip("在结算界面点击下一局按钮中心，让程序记住按钮样子。")
             self.save_settings_button.setToolTip("保存上面的设置到 config.json。")
 
-            self.start_button.clicked.connect(self.toggle_helper)
-            self.reload_button.clicked.connect(self.reload_helper)
             self.calibrate_button.clicked.connect(self.calibrate_helper)
-            self.exit_button.clicked.connect(self.close)
             self.recognize_turn_button.clicked.connect(self.recognize_turn_indicator)
             self.recognize_next_button.clicked.connect(self.recognize_next_game)
             self.save_settings_button.clicked.connect(self.save_settings)
-
-            buttons = QHBoxLayout()
-            buttons.addWidget(self.start_button)
-            buttons.addWidget(self.reload_button)
-            buttons.addWidget(self.calibrate_button)
-            buttons.addWidget(self.exit_button)
 
             move_time_row = QHBoxLayout()
             move_time_row.addWidget(self.min_time_spin)
@@ -994,7 +1392,9 @@ def launch_gui():
             settings = QGroupBox("常用设置")
             settings_form = QFormLayout()
             settings_form.addRow("思考时间", move_time_row)
+            settings_form.addRow(self.auto_move_checkbox)
             settings_form.addRow(self.turn_indicator_checkbox)
+            settings_form.addRow("棋盘位置", self.calibrate_button)
             settings_form.addRow("轮到我识别", self.recognize_turn_button)
             settings_form.addRow(self.auto_next_checkbox)
             settings_form.addRow(self.active_next_scan_checkbox)
@@ -1002,13 +1402,1085 @@ def launch_gui():
             settings_form.addRow("", self.save_settings_button)
             settings.setLayout(settings_form)
 
-            layout = QVBoxLayout()
-            layout.addWidget(self.title)
-            layout.addWidget(self.status)
-            layout.addLayout(buttons)
-            layout.addWidget(settings)
-            self.setLayout(layout)
+            close_settings_button = QPushButton("关闭")
+            close_settings_button.clicked.connect(self.hide_settings_dialog)
+            settings_dialog_layout = QVBoxLayout()
+            settings_dialog_layout.addWidget(settings)
+            settings_dialog_layout.addWidget(close_settings_button)
+            self.settings_dialog = QDialog(self)
+            self.settings_dialog.setWindowTitle("连线设置")
+            self.settings_dialog.setModal(False)
+            self.settings_dialog.setLayout(settings_dialog_layout)
+
+            self.analysis_box = QPlainTextEdit()
+            self.analysis_box.setReadOnly(True)
+            self.analysis_box.setPlainText(self.analysis_text)
+            analysis_dialog_layout = QVBoxLayout()
+            analysis_dialog_layout.addWidget(self.analysis_box)
+            close_analysis_button = QPushButton("关闭")
+            close_analysis_button.clicked.connect(self.hide_analysis_dialog)
+            analysis_dialog_layout.addWidget(close_analysis_button)
+            self.analysis_dialog = QDialog(self)
+            self.analysis_dialog.setWindowTitle("分析详情")
+            self.analysis_dialog.setModal(False)
+            self.analysis_dialog.resize(420, 260)
+            self.analysis_dialog.setLayout(analysis_dialog_layout)
+
+            board_content = QVBoxLayout()
+            board_content.addWidget(self.board_label, 1)
+            board_content.addWidget(self.status)
+
+            self.side_panel_title = QLabel("导航")
+            self.side_panel_title.setStyleSheet("font-weight: 600;")
+            self.side_panel_text = QPlainTextEdit()
+            self.side_panel_text.setReadOnly(True)
+            self.side_panel_text.setMinimumWidth(260)
+            self.nav_buttons_widget = QWidget()
+            nav_buttons = QHBoxLayout()
+            nav_buttons.setContentsMargins(0, 0, 0, 0)
+            self.nav_first_button = QPushButton("|<")
+            self.nav_prev_button = QPushButton("<")
+            self.nav_next_button = QPushButton(">")
+            self.nav_last_button = QPushButton(">|")
+            self.nav_first_button.setToolTip("退到第一步")
+            self.nav_prev_button.setToolTip("上一步")
+            self.nav_next_button.setToolTip("下一步")
+            self.nav_last_button.setToolTip("快进到最后一步")
+            self.nav_first_button.clicked.connect(lambda: self.goto_history_index(0))
+            self.nav_prev_button.clicked.connect(lambda: self.goto_history_index(self.history_index - 1))
+            self.nav_next_button.clicked.connect(lambda: self.goto_history_index(self.history_index + 1))
+            self.nav_last_button.clicked.connect(lambda: self.goto_history_index(len(self.history_fens) - 1))
+            for button in (
+                self.nav_first_button,
+                self.nav_prev_button,
+                self.nav_next_button,
+                self.nav_last_button,
+            ):
+                nav_buttons.addWidget(button)
+            self.nav_buttons_widget.setLayout(nav_buttons)
+            self.nav_buttons_widget.hide()
+            self.nav_controls_widget = QWidget()
+            nav_controls = QVBoxLayout()
+            nav_controls.setContentsMargins(0, 0, 0, 0)
+            self.red_ai_checkbox = QCheckBox("红方电脑走棋")
+            self.black_ai_checkbox = QCheckBox("黑方电脑走棋")
+            self.red_ai_checkbox.setToolTip("勾选后，轮到红方时电脑自动走。")
+            self.black_ai_checkbox.setToolTip("勾选后，轮到黑方时电脑自动走。")
+            self.red_ai_checkbox.stateChanged.connect(lambda _state: self.on_computer_side_changed())
+            self.black_ai_checkbox.stateChanged.connect(lambda _state: self.on_computer_side_changed())
+            nav_controls.addWidget(self.red_ai_checkbox)
+            nav_controls.addWidget(self.black_ai_checkbox)
+
+            search_mode_row = QHBoxLayout()
+            self.search_mode_combo = QComboBox()
+            self.search_mode_combo.addItems(["时间优先", "深度优先"])
+            self.search_mode_combo.setToolTip("时间优先按秒数计算；深度优先按搜索深度计算。")
+            self.search_mode_combo.currentTextChanged.connect(lambda _text: self.refresh_navigation_text())
+            search_mode_row.addWidget(QLabel("搜索"))
+            search_mode_row.addWidget(self.search_mode_combo, 1)
+            nav_controls.addLayout(search_mode_row)
+
+            search_value_row = QHBoxLayout()
+            self.ai_time_spin = self.make_seconds_spin(0.1, 60.0)
+            self.ai_time_spin.setValue(1.0)
+            self.ai_time_spin.setToolTip("时间优先时，每步最多思考几秒。")
+            self.ai_time_spin.valueChanged.connect(lambda _value: self.refresh_navigation_text())
+            self.ai_depth_spin = QSpinBox()
+            self.ai_depth_spin.setRange(1, 99)
+            self.ai_depth_spin.setValue(8)
+            self.ai_depth_spin.setToolTip("深度优先时，搜索到多少层。")
+            self.ai_depth_spin.valueChanged.connect(lambda _value: self.refresh_navigation_text())
+            search_value_row.addWidget(QLabel("时间"))
+            search_value_row.addWidget(self.ai_time_spin)
+            search_value_row.addWidget(QLabel("深度"))
+            search_value_row.addWidget(self.ai_depth_spin)
+            nav_controls.addLayout(search_value_row)
+            self.nav_controls_widget.setLayout(nav_controls)
+            self.nav_controls_widget.hide()
+            side_panel_layout = QVBoxLayout()
+            side_panel_layout.addWidget(self.side_panel_title)
+            side_panel_layout.addWidget(self.nav_buttons_widget)
+            side_panel_layout.addWidget(self.nav_controls_widget)
+            side_panel_layout.addWidget(self.side_panel_text, 1)
+            self.side_panel = QWidget()
+            self.side_panel.setFixedWidth(270)
+            self.side_panel.setLayout(side_panel_layout)
+            self.side_panel.hide()
+
+            content = QHBoxLayout()
+            content.addLayout(board_content, 1)
+            content.addWidget(self.side_panel)
+
+            central = QWidget()
+            central.setLayout(content)
+            self.setCentralWidget(central)
+            self.setMenuBar(self.create_menu_bar())
             self.load_settings()
+            self.load_game_from_fen(START_FEN)
+            self.game_mode = "setup"
+            self.show_navigation_panel()
+            self.set_status("摆谱：已载入初始棋盘，可点击棋子走子")
+            QTimer.singleShot(0, self.enforce_startup_layout)
+            QTimer.singleShot(120, self.enforce_startup_layout)
+
+        def create_menu_bar(self):
+            menu_bar = QMenuBar()
+
+            file_menu = menu_bar.addMenu("文件(&F)")
+            copy_fen_action = QAction("复制当前 FEN(&C)", self)
+            copy_fen_action.triggered.connect(self.copy_fen)
+            self.copy_fen_action = copy_fen_action
+            file_menu.addAction(copy_fen_action)
+            file_menu.addSeparator()
+            exit_action = QAction("退出(&X)", self)
+            exit_action.triggered.connect(self.close)
+            file_menu.addAction(exit_action)
+
+            self.calculate_button = None
+            start_action = QAction("开始监控(&S)", self)
+            start_action.setStatusTip("开始或停止屏幕监控。")
+            start_action.triggered.connect(self.toggle_helper)
+            self.start_button = start_action
+            reload_action = QAction("重新读取(&R)", self)
+            reload_action.setStatusTip("重新读取设置和校准数据。")
+            reload_action.triggered.connect(self.reload_helper)
+            self.reload_button = reload_action
+
+            game_menu = menu_bar.addMenu("分析(&A)")
+            import_record_action = QAction("导入棋谱(&I)", self)
+            import_record_action.triggered.connect(self.import_game_record)
+            game_menu.addAction(import_record_action)
+            setup_record_action = QAction("摆谱(&S)", self)
+            setup_record_action.triggered.connect(self.start_position_setup_mode)
+            game_menu.addAction(setup_record_action)
+            library_action = QAction("棋谱库(&L)", self)
+            library_action.triggered.connect(self.start_library_mode)
+            game_menu.addAction(library_action)
+
+            options_menu = menu_bar.addMenu("连线(&L)")
+            options_menu.addAction(start_action)
+            options_menu.addAction(reload_action)
+            options_menu.addSeparator()
+            settings_action = QAction("设置(&S)", self)
+            settings_action.triggered.connect(self.show_settings_dialog)
+            options_menu.addAction(settings_action)
+            tips_action = QAction("使用提示(&T)", self)
+            tips_action.triggered.connect(self.show_usage_tips)
+            options_menu.addAction(tips_action)
+
+            help_menu = menu_bar.addMenu("帮助(&H)")
+            engine_action = QAction("检测引擎(&E)", self)
+            engine_action.triggered.connect(self.check_engine_status)
+            help_menu.addAction(engine_action)
+            about_action = QAction("关于象棋助手(&A)", self)
+            about_action.triggered.connect(lambda: self.set_status("象棋助手 - 屏幕识别与 Pikafish 分析"))
+            help_menu.addAction(about_action)
+            return menu_bar
+
+        def show_analysis_dialog(self):
+            self.analysis_box.setPlainText(self.analysis_text)
+            self.analysis_dialog.show()
+            self.analysis_dialog.raise_()
+            self.analysis_dialog.activateWindow()
+            if hasattr(self, "pv_analysis_action"):
+                self.pv_analysis_action.setChecked(True)
+
+        def hide_analysis_dialog(self):
+            self.analysis_dialog.hide()
+            if hasattr(self, "pv_analysis_action"):
+                self.pv_analysis_action.setChecked(False)
+
+        def toggle_pv_analysis_window(self, checked):
+            if checked:
+                self.analysis_box.setPlainText(self.analysis_text)
+                self.analysis_dialog.show()
+                self.analysis_dialog.raise_()
+                self.analysis_dialog.activateWindow()
+                self.set_status("已显示 PV分析")
+            else:
+                self.analysis_dialog.hide()
+                self.set_status("已隐藏 PV分析")
+
+        def toggle_window_panel(self, name, checked):
+            if checked:
+                self.show_side_panel(name, f"{name}窗口已打开。\n后续可以在这里继续接入完整{name}内容。")
+                self.set_status(f"已显示{name}")
+            else:
+                self.hide_side_panel_if_title(name)
+                self.set_status(f"已隐藏{name}")
+
+        def show_side_panel(self, title, text):
+            self.side_panel_title.setText(title)
+            self.side_panel_text.setPlainText(text)
+            self.nav_buttons_widget.setVisible(title == "导航")
+            self.nav_controls_widget.setVisible(title == "导航")
+            self.refresh_navigation_buttons()
+            self.side_panel.show()
+            self.setMinimumWidth(760)
+            self.setMinimumHeight(580)
+            target_height = max(self.height(), 580)
+            if self.width() < 820 or self.height() < target_height:
+                self.resize(max(self.width(), 820), target_height)
+            self.update_board_display(self.current_grid)
+
+        def enforce_startup_layout(self):
+            self.resize(max(self.width(), 820), max(self.height(), 580))
+            self.update_board_display(self.current_grid)
+
+        def hide_side_panel_if_title(self, title):
+            if self.side_panel_title.text() == title:
+                self.side_panel.hide()
+                self.setMinimumWidth(520)
+                if self.width() > 560:
+                    self.resize(520, self.height())
+
+        def toggle_opening_book_panel(self, checked):
+            if checked:
+                self.show_side_panel("开局库", "")
+                self.load_opening_book_panel()
+                self.set_status("已显示开局库")
+            else:
+                self.hide_side_panel_if_title("开局库")
+                self.set_status("已隐藏开局库")
+
+        def toggle_score_chart_panel(self, checked):
+            if checked:
+                self.show_side_panel("打分图", self.score_chart_text())
+                self.set_status("已显示打分图")
+            else:
+                self.hide_side_panel_if_title("打分图")
+                self.set_status("已隐藏打分图")
+
+        def toggle_navigation_panel(self, checked):
+            if checked:
+                self.show_navigation_panel()
+                self.set_status("已显示导航")
+            else:
+                self.hide_side_panel_if_title("导航")
+                self.set_status("已隐藏导航")
+
+        def choose_opening_book(self):
+            start_dir = os.path.dirname(self.opening_book_path) if self.opening_book_path else r"C:\Users\Tom\Desktop"
+            path, _ = QFileDialog.getOpenFileName(
+                self,
+                "选择开局库",
+                start_dir,
+                "开局库文件 (*.xqb);;所有文件 (*.*)",
+            )
+            if not path:
+                return
+            self.opening_book_path = path
+            if hasattr(self, "opening_book_action"):
+                self.opening_book_action.setChecked(True)
+            self.side_panel_title.setText("开局库")
+            self.side_panel.show()
+            self.setMinimumWidth(720)
+            if self.width() < 820:
+                self.resize(820, self.height())
+            self.load_opening_book_panel()
+            self.set_status("已选择开局库")
+
+        def find_opening_book_path(self):
+            return os.path.join(os.path.dirname(os.path.abspath(__file__)), "book.xqb")
+
+        def load_opening_book_panel(self):
+            if not self.opening_book_path:
+                self.side_panel_text.setPlainText(
+                    "没有找到开局库文件。\n\n请确认目录存在：\nC:\\Users\\Tom\\Desktop\\xqbook-main"
+                )
+                return
+
+            text = [
+                "开局库文件：",
+                self.opening_book_path,
+                "",
+            ]
+            try:
+                size_mb = os.path.getsize(self.opening_book_path) / (1024 * 1024)
+                text.append(f"大小：{size_mb:.1f} MB")
+            except OSError:
+                pass
+
+            try:
+                uri = pathlib.Path(self.opening_book_path).as_uri() + "?mode=ro"
+                conn = sqlite3.connect(uri, uri=True)
+                try:
+                    row = conn.execute("select count(*) from book").fetchone()
+                    count = row[0] if row else 0
+                    text.append(f"记录数：{count:,}")
+                finally:
+                    conn.close()
+            except Exception as e:
+                text.append("")
+                text.append(f"数据库读取失败：{e}")
+
+            text.extend([
+                "",
+                "当前局面：",
+                self.current_fen or "还没有读取到棋盘局面。",
+                "",
+            ])
+            moves = self.query_xqbook(self.current_fen) if self.current_fen else []
+            if moves:
+                text.append("开局走法：")
+                for index, item in enumerate(moves[:20], 1):
+                    stats = f"胜{item['win']} 和{item['draw']} 负{item['lost']}"
+                    memo = f"  {item['memo']}" if item["memo"] else ""
+                    move_text = self.format_chinese_move(self.current_fen, item["uci"])
+                    text.append(
+                        f"{index}. {move_text}  分数 {item['score']}  {stats}{memo}"
+                    )
+            else:
+                text.extend([
+                    "开局走法：",
+                    "当前局面在开局库里没有找到记录。",
+                ])
+            self.side_panel_text.setPlainText("\n".join(text))
+
+        def xqbook_fen_to_key(self, fen):
+            placement, side = fen.strip().split()[:2]
+            rows = placement.count("/") + 1
+            first_row = placement.split("/", 1)[0]
+            cols = sum(int(ch) if ch.isdigit() else 1 for ch in first_row)
+            size = rows * cols
+            turn_is_red = side != "b"
+            piece_codes = {
+                "X": 0, "x": 0,
+                "R": 1, "N": 2, "B": 3, "A": 4, "K": 5, "C": 6, "P": 7,
+                "r": 9, "n": 10, "b": 11, "a": 12, "k": 13, "c": 14, "p": 15,
+            }
+            cells = [-1] * size
+            index = 0
+            for ch in placement:
+                if ch == "/":
+                    continue
+                if ch.isdigit():
+                    index += int(ch)
+                    continue
+                lookup = ch if turn_is_red else ch.swapcase()
+                cells[index] = piece_codes.get(lookup, -1)
+                index += 1
+
+            mirror_ud = False
+            if not turn_is_red:
+                for row in range(rows // 2):
+                    for col in range(cols):
+                        a = row * cols + col
+                        b = (rows - 1 - row) * cols + (cols - 1 - col)
+                        cells[a], cells[b] = cells[b], cells[a]
+                mirror_ud = True
+
+            mirror_lr = False
+            lr_done = False
+            for row in range(rows):
+                if lr_done:
+                    break
+                for col in range(cols // 2):
+                    a = row * cols + col
+                    b = row * cols + (cols - 1 - col)
+                    if cells[a] != cells[b]:
+                        mirror_lr = cells[b] > cells[a]
+                        lr_done = True
+                        break
+            if mirror_lr:
+                for row in range(rows):
+                    for col in range(cols // 2):
+                        a = row * cols + col
+                        b = row * cols + (cols - 1 - col)
+                        cells[a], cells[b] = cells[b], cells[a]
+
+            out = bytearray()
+            buffer = 0
+            bits = 0
+            buffer_bits = 32
+            code_bits = 4
+            for idx, value in enumerate(cells):
+                if value == -1:
+                    bits += 1
+                else:
+                    buffer |= 1 << (buffer_bits - bits - 1)
+                    buffer |= value << (buffer_bits - bits - 1 - code_bits)
+                    bits += 1 + code_bits
+                next_value = cells[idx + 1] if idx + 1 < len(cells) else None
+                need_bits = 1 if next_value == -1 else code_bits + 1
+                if idx == len(cells) - 1 or buffer_bits - bits < need_bits:
+                    threshold = 1 if idx == len(cells) - 1 else 8
+                    while bits >= threshold:
+                        out.append((buffer >> (buffer_bits - 8)) & 0xFF)
+                        buffer = (buffer << 8) & 0xFFFFFFFF
+                        bits -= 8
+            return bytes(out), mirror_ud, mirror_lr, rows, cols
+
+        def xqbook_mirror_move(self, move, mirror_ud, mirror_lr, rows, cols):
+            from_row = move >> 12
+            from_col = (move >> 8) & 0xF
+            to_row = (move >> 4) & 0xF
+            to_col = move & 0xF
+            if mirror_ud:
+                from_row = rows - 1 - from_row
+                to_row = rows - 1 - to_row
+                from_col = cols - 1 - from_col
+                to_col = cols - 1 - to_col
+            if mirror_lr:
+                from_col = cols - 1 - from_col
+                to_col = cols - 1 - to_col
+            return from_row, from_col, to_row, to_col
+
+        def query_xqbook(self, fen):
+            if not self.opening_book_path or not fen:
+                return []
+            key, mirror_ud, mirror_lr, rows, cols = self.xqbook_fen_to_key(fen)
+            uri = pathlib.Path(self.opening_book_path).as_uri() + "?mode=ro"
+            results = []
+            conn = sqlite3.connect(uri, uri=True)
+            try:
+                query = (
+                    "select Id,Move,Score,Win,Draw,Lost,Valid,Memo "
+                    "from book where key=? order by Score desc, Win desc, Id asc"
+                )
+                for row in conn.execute(query, (sqlite3.Binary(key),)):
+                    _, raw_move, score, win, draw, lost, valid, memo = row
+                    src_row, src_col, dst_row, dst_col = self.xqbook_mirror_move(
+                        int(raw_move), mirror_ud, mirror_lr, rows, cols
+                    )
+                    results.append({
+                        "uci": coords_to_uci(src_row, src_col, dst_row, dst_col),
+                        "score": score,
+                        "win": win,
+                        "draw": draw,
+                        "lost": lost,
+                        "valid": valid,
+                        "memo": memo or "",
+                    })
+            finally:
+                conn.close()
+            return results
+
+        def score_chart_text(self):
+            lines = ["打分图", ""]
+            if not self.history_fens:
+                lines.append("还没有棋谱历史。")
+                return "\n".join(lines)
+            lines.append("当前先显示每步的开局库分数摘要；后续可以接入逐步引擎评分曲线。")
+            lines.append("")
+            for index, fen in enumerate(self.history_fens):
+                moves = self.query_xqbook(fen)
+                score = moves[0]["score"] if moves else 0
+                bar_len = min(20, abs(int(score)) // 100)
+                bar = ("+" if score >= 0 else "-") * bar_len
+                marker = " <- 当前" if index == self.history_index else ""
+                lines.append(f"{index:>3}. {score:>5} {bar}{marker}")
+            return "\n".join(lines)
+
+        def format_chinese_move(self, fen, move):
+            try:
+                board, _ = fen_to_board(fen)
+                return move_to_chinese(board, move)
+            except Exception:
+                return move
+
+        def show_navigation_panel(self):
+            self.show_side_panel("导航", self.navigation_text())
+
+        def refresh_navigation_text(self):
+            if self.side_panel.isVisible() and self.side_panel_title.text() == "导航":
+                self.side_panel_text.setPlainText(self.navigation_text())
+
+        def refresh_navigation_buttons(self):
+            total = max(0, len(self.history_fens) - 1)
+            can_go_back = self.history_index > 0
+            can_go_forward = self.history_index < total
+            self.nav_first_button.setEnabled(can_go_back)
+            self.nav_prev_button.setEnabled(can_go_back)
+            self.nav_next_button.setEnabled(can_go_forward)
+            self.nav_last_button.setEnabled(can_go_forward)
+
+        def navigation_text(self):
+            lines = ["棋谱导航", ""]
+            total = max(0, len(self.history_fens) - 1)
+            lines.append(f"当前步数：{self.history_index} / {total}")
+            lines.append(f"当前走棋：{'红方' if self.game_side == 'red' else '黑方'}")
+            search_value = (
+                f"深度 {self.ai_depth_spin.value()}"
+                if self.search_mode_combo.currentText() == "深度优先"
+                else f"时间 {self.ai_time_spin.value():.1f} 秒"
+            )
+            auto_sides = []
+            if self.red_ai_checkbox.isChecked():
+                auto_sides.append("红方")
+            if self.black_ai_checkbox.isChecked():
+                auto_sides.append("黑方")
+            lines.append(f"电脑走棋：{('、'.join(auto_sides) if auto_sides else '未开启')}    {search_value}")
+            lines.append("")
+            lines.append("历史步：")
+            if not self.history_moves:
+                lines.append("还没有走法。")
+            else:
+                for round_index in range(0, len(self.history_moves), 2):
+                    red_step = round_index + 1
+                    black_step = round_index + 2
+                    red_fen = self.history_fens[red_step - 1] if red_step - 1 < len(self.history_fens) else ""
+                    red_move = self.format_chinese_move(red_fen, self.history_moves[round_index])
+                    red_marker = " <- 当前" if red_step == self.history_index else ""
+                    if black_step <= len(self.history_moves):
+                        black_fen = self.history_fens[black_step - 1] if black_step - 1 < len(self.history_fens) else ""
+                        black_move = self.format_chinese_move(black_fen, self.history_moves[round_index + 1])
+                        black_marker = " <- 当前" if black_step == self.history_index else ""
+                        lines.append(
+                            f"第{round_index // 2 + 1}回合  {red_move}{red_marker}    {black_move}{black_marker}"
+                        )
+                    else:
+                        lines.append(f"第{round_index // 2 + 1}回合  {red_move}{red_marker}")
+            lines.append("")
+            lines.append("分支走法：")
+            branches = self.query_xqbook(self.current_fen) if self.current_fen else []
+            if branches:
+                for index, item in enumerate(branches[:20], 1):
+                    stats = f"胜{item['win']} 和{item['draw']} 负{item['lost']}"
+                    move_text = self.format_chinese_move(self.current_fen, item["uci"])
+                    lines.append(f"{index}. {move_text}  分数 {item['score']}  {stats}")
+            else:
+                lines.append("当前局面没有开局库分支。")
+            return "\n".join(lines)
+
+        def goto_history_index(self, index):
+            if not self.history_fens:
+                return
+            index = max(0, min(index, len(self.history_fens) - 1))
+            self.history_index = index
+            fen = self.history_fens[index]
+            board, side = fen_to_board(fen)
+            self.game_board = board
+            self.game_side = side
+            self.current_fen = fen
+            self.current_grid = [row[:] for row in board]
+            self.current_move = self.history_moves[index - 1] if index > 0 and index - 1 < len(self.history_moves) else ""
+            self.selected_square = None
+            self.legal_target_moves = {}
+            self.update_board_display(self.current_grid)
+            self.refresh_navigation_buttons()
+            if self.side_panel.isVisible():
+                if self.side_panel_title.text() == "导航":
+                    self.side_panel_text.setPlainText(self.navigation_text())
+                elif self.side_panel_title.text() == "开局库":
+                    self.load_opening_book_panel()
+                elif self.side_panel_title.text() == "打分图":
+                    self.side_panel_text.setPlainText(self.score_chart_text())
+            self.set_status(f"已跳到第 {self.history_index} 步")
+
+        def show_settings_dialog(self):
+            self.settings_dialog.show()
+            self.settings_dialog.raise_()
+            self.settings_dialog.activateWindow()
+
+        def hide_settings_dialog(self):
+            self.settings_dialog.hide()
+
+        def mode_single_calculation(self):
+            self.auto_move_checkbox.setChecked(False)
+            self.save_settings(silent=True)
+            self.calculate_now()
+            self.set_status("单次计算模式：正在计算当前棋盘")
+
+        def mode_screen_monitor(self):
+            if not self.helper_running():
+                self.start_helper()
+            else:
+                self.set_status("屏幕监控模式已经在运行")
+
+        def mode_analysis_only(self):
+            self.auto_move_checkbox.setChecked(False)
+            self.save_settings(silent=True)
+            if not self.helper_running():
+                self.start_helper()
+            self.set_status("只分析不走模式：不会自动点击棋子")
+
+        def mode_auto_move(self):
+            self.auto_move_checkbox.setChecked(True)
+            self.save_settings(silent=True)
+            if not self.helper_running():
+                self.start_helper()
+            self.set_status("自动走棋模式：识别稳定后会自动点击推荐走法")
+
+        def mode_analysis_detail(self):
+            self.show_analysis_dialog()
+            if not self.current_move and not (self.calculate_thread and self.calculate_thread.is_alive()):
+                self.calculate_now()
+            self.set_status("分析详情模式：显示实时分数和候选走法")
+
+        def mode_setup(self):
+            self.show_settings_dialog()
+            self.set_status("校准设置模式：可校准棋盘和调整选项")
+
+        def start_human_game(self):
+            self.load_game_from_fen(START_FEN)
+            self.game_mode = "human"
+            self.player_side = "both"
+            self.board_flipped = False
+            self.update_board_display(self.current_grid)
+            self.set_status("人人对弈：红方走")
+
+        def start_ai_game(self, side):
+            self.load_game_from_fen(START_FEN)
+            self.game_mode = "ai"
+            self.player_side = side
+            self.board_flipped = side == "black"
+            self.update_board_display(self.current_grid)
+            self.set_status(f"人机对弈：你执{'红' if side == 'red' else '黑'}")
+            if self.game_side != self.player_side:
+                self.request_ai_move()
+
+        def start_trainer_mode(self):
+            self.load_game_from_fen(self.current_fen or START_FEN)
+            self.game_mode = "trainer"
+            self.show_analysis_dialog()
+            self.calculate_local_position("训练模式：先看提示，想好后再走")
+
+        def start_position_setup_mode(self):
+            self.load_game_from_fen(START_FEN)
+            self.game_mode = "setup"
+            self.show_navigation_panel()
+            self.set_status("摆谱：已载入初始棋盘，可点击棋子走子")
+
+        def import_game_record(self):
+            path, _ = QFileDialog.getOpenFileName(
+                self,
+                "导入棋谱",
+                "",
+                "棋谱文件 (*.pgn *.pgns *.txt);;所有文件 (*.*)",
+            )
+            if not path:
+                return
+            try:
+                with open(path, "r", encoding="utf-8", errors="ignore") as file:
+                    text = file.read()
+                parsed = parse_pgn(text)
+                self.load_game_from_fen(parsed["fen"])
+                self.game_mode = "record"
+                self.history_fens = parsed.get("fens", [parsed["fen"]])
+                self.history_moves = [item["uci"] for item in parsed.get("moves", [])]
+                self.history_index = len(self.history_fens) - 1
+                self.current_move = self.history_moves[-1] if self.history_moves else ""
+                self.refresh_navigation_buttons()
+                self.update_board_display(self.current_grid)
+                self.show_text_dialog(
+                    "导入棋谱",
+                    f"已导入：{os.path.basename(path)}\n"
+                    f"步数：{len(parsed['moves'])}\n"
+                    f"当前局面：{parsed['fen']}",
+                )
+                self.set_status(f"已导入棋谱，共 {len(parsed['moves'])} 步")
+                if self.side_panel.isVisible() and self.side_panel_title.text() == "导航":
+                    self.side_panel_text.setPlainText(self.navigation_text())
+            except Exception as e:
+                self.set_status(f"导入棋谱失败：{e}")
+
+        def start_pgn_mode(self):
+            self.show_text_dialog("PGN 复盘", "PGN 导入和前后步复盘会作为下一步继续移植。")
+            self.set_status("PGN 复盘模式待继续移植")
+
+        def start_library_mode(self):
+            self.show_text_dialog("棋谱库", "棋谱库需要本地保存、搜索和导入 PGN，后续继续移植。")
+            self.set_status("棋谱库模式待继续移植")
+
+        def start_online_mode(self):
+            self.show_text_dialog("在线对弈", "在线对弈需要服务器登录、房间和匹配系统，后续继续移植。")
+            self.set_status("在线对弈模式待继续移植")
+
+        def load_game_from_fen(self, fen):
+            try:
+                board, side = fen_to_board(fen)
+            except Exception:
+                board, side = fen_to_board(START_FEN)
+            self.game_board = board
+            self.game_side = side
+            self.current_fen = board_to_fen(board, side)
+            self.current_grid = [row[:] for row in board]
+            self.current_move = ""
+            self.selected_square = None
+            self.legal_target_moves = {}
+            self.move_history = []
+            self.history_fens = [self.current_fen]
+            self.history_moves = []
+            self.history_index = 0
+            self.update_board_display(self.current_grid)
+            self.refresh_navigation_buttons()
+            if self.side_panel.isVisible() and self.side_panel_title.text() == "开局库":
+                self.load_opening_book_panel()
+
+        def display_square(self, row, col):
+            if self.board_flipped:
+                return 9 - row, 8 - col
+            return row, col
+
+        def logical_square(self, row, col):
+            if self.board_flipped:
+                return 9 - row, 8 - col
+            return row, col
+
+        def handle_board_click(self, event):
+            if self.game_mode not in {"human", "ai", "trainer", "setup"} or self.game_board is None:
+                return
+            if self.is_computer_turn():
+                self.set_status("请等电脑走完")
+                return
+            square = self.board_square_from_pos(event.pos().x(), event.pos().y())
+            if square is None:
+                return
+            row, col = square
+            if self.selected_square is None:
+                self.select_game_square(row, col)
+                return
+            move = self.legal_target_moves.get((row, col))
+            if move:
+                self.play_local_move(move)
+                return
+            self.select_game_square(row, col)
+
+        def board_square_from_pos(self, x, y):
+            if not self.board_draw_rect:
+                return None
+            left, top, width, height = self.board_draw_rect
+            if x < left or y < top or x >= left + width or y >= top + height:
+                return None
+            col = int((x - left) / width * 9)
+            row = int((y - top) / height * 10)
+            if 0 <= row < 10 and 0 <= col < 9:
+                return self.logical_square(row, col)
+            return None
+
+        def select_game_square(self, row, col):
+            piece = self.game_board[row][col]
+            if piece_side(piece) != self.game_side:
+                self.selected_square = None
+                self.legal_target_moves = {}
+                self.update_board_display(self.current_grid)
+                return
+            moves = legal_moves_for_piece(self.game_board, row, col)
+            self.selected_square = (row, col)
+            self.legal_target_moves = {
+                uci_to_coords(move)[2:4]: move
+                for move in moves
+            }
+            self.update_board_display(self.current_grid)
+            self.set_status(f"已选中：{self.PIECE_LABELS.get(piece, piece)}")
+
+        def play_local_move(self, move):
+            if not is_legal_move(self.game_board, self.game_side, move):
+                self.set_status("这步不合法")
+                return
+            if self.history_fens and self.history_index < len(self.history_fens) - 1:
+                self.history_fens = self.history_fens[: self.history_index + 1]
+                self.history_moves = self.history_moves[: self.history_index]
+            self.game_board = apply_uci(self.game_board, move)
+            self.move_history.append(move)
+            self.history_moves.append(move)
+            self.game_side = opponent(self.game_side)
+            self.current_fen = board_to_fen(self.game_board, self.game_side)
+            self.history_fens.append(self.current_fen)
+            self.history_index = len(self.history_fens) - 1
+            self.current_grid = [row[:] for row in self.game_board]
+            self.current_move = move
+            self.selected_square = None
+            self.legal_target_moves = {}
+            self.update_board_display(self.current_grid)
+            self.refresh_navigation_buttons()
+            self.set_status(f"{'红方' if self.game_side == 'red' else '黑方'}走")
+            if self.side_panel.isVisible() and self.side_panel_title.text() == "开局库":
+                self.load_opening_book_panel()
+            elif self.side_panel.isVisible() and self.side_panel_title.text() == "导航":
+                self.side_panel_text.setPlainText(self.navigation_text())
+            elif self.side_panel.isVisible() and self.side_panel_title.text() == "打分图":
+                self.side_panel_text.setPlainText(self.score_chart_text())
+            if self.game_mode == "ai" and self.game_side != self.player_side:
+                self.request_ai_move()
+            elif self.is_computer_turn():
+                self.request_ai_move()
+            elif self.game_mode == "trainer":
+                self.calculate_local_position("训练模式：继续找最佳走法")
+
+        def on_computer_side_changed(self):
+            if self.side_panel.isVisible() and self.side_panel_title.text() == "导航":
+                self.side_panel_text.setPlainText(self.navigation_text())
+            if self.is_computer_turn():
+                self.request_ai_move()
+
+        def is_computer_turn(self):
+            if self.game_board is None:
+                return False
+            return (
+                (self.game_side == "red" and self.red_ai_checkbox.isChecked())
+                or (self.game_side == "black" and self.black_ai_checkbox.isChecked())
+            )
+
+        def selected_ai_search(self):
+            if self.search_mode_combo.currentText() == "深度优先":
+                return None, self.ai_depth_spin.value()
+            return int(round(self.ai_time_spin.value() * 1000)), None
+
+        def request_ai_move(self):
+            if self.ai_thread and self.ai_thread.is_alive():
+                return
+            self.set_status("AI 正在思考...")
+            self.pending_ai_movetime, self.pending_ai_depth = self.selected_ai_search()
+            self.pending_ai_fen = self.current_fen
+            self.ai_thread = threading.Thread(target=self.run_ai_move, daemon=True)
+            self.ai_thread.start()
+
+        def run_ai_move(self):
+            engine = None
+            try:
+                fen = self.current_fen
+                side = self.game_side
+                movetime = self.pending_ai_movetime
+                depth = self.pending_ai_depth
+                engine = Engine()
+                engine.start_search(fen, movetime=movetime, depth=depth)
+                deadline = time.time() + ((movetime / 1000.0 + 3.0) if movetime else max(8.0, depth * 1.5))
+                while engine.bestmove is None and time.time() < deadline:
+                    time.sleep(0.05)
+                move = engine.bestmove
+                if move and move != "(none)" and side == self.game_side:
+                    self.signals.move.emit(move, "AI")
+                    try:
+                        board, _ = fen_to_board(fen)
+                        move_text = move_to_chinese(board, move)
+                    except Exception:
+                        move_text = move
+                    self.signals.status.emit(f"AI 走棋：{move_text}")
+                    self.signals.local_move.emit(move)
+                else:
+                    self.signals.status.emit("AI 没有找到走法")
+            except Exception as e:
+                self.signals.status.emit(f"AI 计算失败：{e}")
+            finally:
+                if engine is not None:
+                    engine.quit()
+                self.signals.ai_done.emit()
+
+        def on_ai_done(self):
+            if self.closing:
+                return
+            self.ai_thread = None
+            finished_fen = self.pending_ai_fen
+            if self.is_computer_turn():
+                if finished_fen and self.current_fen == finished_fen:
+                    return
+                self.request_ai_move()
+
+        def apply_ai_move(self, move):
+            if self.pending_ai_fen and self.current_fen != self.pending_ai_fen:
+                self.set_status("局面已变化，已忽略电脑旧走法")
+                return
+            if self.game_mode != "ai" and not self.is_computer_turn():
+                self.set_status("电脑走棋已关闭")
+                return
+            if self.game_board is not None and is_legal_move(self.game_board, self.game_side, move):
+                self.play_local_move(move)
+
+        def calculate_local_position(self, status_text):
+            self.analysis_text = "正在分析当前棋盘..."
+            self.show_analysis_dialog()
+            self.set_status(status_text)
+
+        def resizeEvent(self, event):
+            super().resizeEvent(event)
+            self.update_board_display(self.current_grid)
+
+        def update_fen(self, fen):
+            self.current_fen = fen or ""
+            if self.side_panel.isVisible() and self.side_panel_title.text() == "开局库":
+                self.load_opening_book_panel()
+            elif self.side_panel.isVisible() and self.side_panel_title.text() == "导航":
+                self.side_panel_text.setPlainText(self.navigation_text())
+            elif self.side_panel.isVisible() and self.side_panel_title.text() == "打分图":
+                self.side_panel_text.setPlainText(self.score_chart_text())
+
+        def update_analysis_display(self, text):
+            self.analysis_text = text or "还没有分析结果。"
+            if self.analysis_dialog.isVisible():
+                self.analysis_box.setPlainText(self.analysis_text)
+
+        def copy_fen(self):
+            if not self.current_fen:
+                self.set_status("还没有可复制的 FEN，请先计算或开始识别。")
+                return
+            QApplication.clipboard().setText(self.current_fen)
+            self.set_status("已复制当前 FEN")
+
+        def show_current_fen(self):
+            if not self.current_fen:
+                self.set_status("还没有 FEN，请先计算或开始识别。")
+                return
+            self.show_text_dialog("当前 FEN", self.current_fen)
+
+        def copy_analysis_text(self):
+            QApplication.clipboard().setText(self.analysis_text)
+            self.set_status("已复制分析详情")
+
+        def clear_move_marker(self):
+            self.current_move = ""
+            self.current_move_label = ""
+            self.update_board_display(self.current_grid)
+            self.set_status("已清除棋盘标记")
+
+        def show_usage_tips(self):
+            self.show_text_dialog(
+                "使用提示",
+                "1. 第一次使用先打开 连线 -> 设置 -> 校准棋盘。\n"
+                "2. 想持续跟随屏幕棋盘，点 连线 -> 开始监控。\n"
+                "3. 计算时会显示实时分数和候选走法。\n"
+                "4. 自动走棋建议确认识别稳定以后再开启。",
+            )
+
+        def show_text_dialog(self, title, text):
+            dialog = QDialog(self)
+            dialog.setWindowTitle(title)
+            dialog.setModal(False)
+            layout = QVBoxLayout()
+            box = QPlainTextEdit()
+            box.setReadOnly(True)
+            box.setPlainText(text)
+            layout.addWidget(box)
+
+            buttons = QHBoxLayout()
+            copy_button = QPushButton("复制")
+            close_button = QPushButton("关闭")
+            copy_button.clicked.connect(lambda: QApplication.clipboard().setText(box.toPlainText()))
+            copy_button.clicked.connect(lambda: self.set_status("已复制"))
+            close_button.clicked.connect(dialog.close)
+            buttons.addWidget(copy_button)
+            buttons.addWidget(close_button)
+            layout.addLayout(buttons)
+
+            dialog.setLayout(layout)
+            dialog.resize(460, 220)
+            self.text_dialogs.append(dialog)
+            dialog.destroyed.connect(lambda: self.text_dialogs.remove(dialog) if dialog in self.text_dialogs else None)
+            dialog.show()
+
+        def update_move_display(self, move, label):
+            self.current_move = move or ""
+            self.current_move_label = label or ""
+            self.update_board_display(self.current_grid)
+
+        def update_board_display(self, grid):
+            if self.board_pixmap.isNull():
+                return
+            if grid is not None:
+                self.current_grid = grid
+
+            board = QPixmap(self.board_pixmap)
+            draw_grid = self.current_grid
+            if draw_grid:
+                painter = QPainter(board)
+                painter.setRenderHint(QPainter.Antialiasing, True)
+                step_x = board.width() / 9.0
+                step_y = board.height() / 10.0
+                radius = int(min(step_x, step_y) * 0.36)
+                font = QFont("Microsoft YaHei", max(14, int(radius * 0.95)))
+                font.setBold(True)
+                painter.setFont(font)
+
+                for row_index, row in enumerate(draw_grid):
+                    for col_index, piece in enumerate(row):
+                        if not piece:
+                            continue
+                        label = self.PIECE_LABELS.get(piece, piece)
+                        draw_row, draw_col = self.display_square(row_index, col_index)
+                        cx = int(round((draw_col + 0.5) * step_x))
+                        cy = int(round((draw_row + 0.5) * step_y))
+                        color = QColor(190, 25, 25) if piece.isupper() else QColor(20, 20, 20)
+
+                        painter.setPen(QPen(color, 3))
+                        painter.setBrush(QBrush(QColor(250, 236, 204, 235)))
+                        painter.drawEllipse(cx - radius, cy - radius, radius * 2, radius * 2)
+                        painter.setPen(QPen(color, 2))
+                        painter.drawText(
+                            cx - radius,
+                            cy - radius,
+                            radius * 2,
+                            radius * 2,
+                            Qt.AlignCenter,
+                            label,
+                        )
+
+                if self.selected_square:
+                    sel_row, sel_col = self.selected_square
+                    draw_sel_row, draw_sel_col = self.display_square(sel_row, sel_col)
+                    sel_x = int(round((draw_sel_col + 0.5) * step_x))
+                    sel_y = int(round((draw_sel_row + 0.5) * step_y))
+                    painter.setBrush(Qt.NoBrush)
+                    painter.setPen(QPen(QColor(240, 160, 20), max(4, radius // 4)))
+                    painter.drawEllipse(sel_x - radius - 4, sel_y - radius - 4, radius * 2 + 8, radius * 2 + 8)
+                    painter.setBrush(QBrush(QColor(60, 150, 90, 175)))
+                    painter.setPen(Qt.NoPen)
+                    target_radius = max(6, radius // 3)
+                    for target_row, target_col in self.legal_target_moves:
+                        draw_target_row, draw_target_col = self.display_square(target_row, target_col)
+                        target_x = int(round((draw_target_col + 0.5) * step_x))
+                        target_y = int(round((draw_target_row + 0.5) * step_y))
+                        painter.drawEllipse(
+                            target_x - target_radius,
+                            target_y - target_radius,
+                            target_radius * 2,
+                            target_radius * 2,
+                        )
+
+                if self.current_move:
+                    try:
+                        src_row, src_col, dst_row, dst_col = uci_to_coords(self.current_move)
+                    except ValueError:
+                        src_row = src_col = dst_row = dst_col = None
+                    if src_row is not None:
+                        draw_src_row, draw_src_col = self.display_square(src_row, src_col)
+                        draw_dst_row, draw_dst_col = self.display_square(dst_row, dst_col)
+                        src_x = int(round((draw_src_col + 0.5) * step_x))
+                        src_y = int(round((draw_src_row + 0.5) * step_y))
+                        dst_x = int(round((draw_dst_col + 0.5) * step_x))
+                        dst_y = int(round((draw_dst_row + 0.5) * step_y))
+                        dx = dst_x - src_x
+                        dy = dst_y - src_y
+                        distance = max(1.0, (dx * dx + dy * dy) ** 0.5)
+                        ux = dx / distance
+                        uy = dy / distance
+                        edge_gap = min(radius, max(0, int(distance / 2) - 1))
+                        start_x = int(round(src_x + ux * edge_gap))
+                        start_y = int(round(src_y + uy * edge_gap))
+                        end_x = int(round(dst_x - ux * edge_gap))
+                        end_y = int(round(dst_y - uy * edge_gap))
+
+                        mark = QColor(220, 30, 30)
+                        line_width = max(5, radius // 4)
+                        painter.setPen(QPen(mark, line_width))
+                        painter.drawLine(start_x, start_y, end_x, end_y)
+
+                        arrow_len = max(16, int(radius * 0.9))
+                        arrow_w = max(9, int(radius * 0.55))
+                        base_x = end_x - ux * arrow_len
+                        base_y = end_y - uy * arrow_len
+                        left_x = int(round(base_x - uy * arrow_w))
+                        left_y = int(round(base_y + ux * arrow_w))
+                        right_x = int(round(base_x + uy * arrow_w))
+                        right_y = int(round(base_y - ux * arrow_w))
+                        painter.drawLine(end_x, end_y, left_x, left_y)
+                        painter.drawLine(end_x, end_y, right_x, right_y)
+
+                painter.end()
+
+            target_size = self.board_label.size()
+            target_width = max(target_size.width(), self.board_label.minimumWidth())
+            target_height = max(target_size.height(), self.board_label.minimumHeight())
+            scaled = board.scaled(
+                target_width,
+                target_height,
+                Qt.KeepAspectRatio,
+                Qt.SmoothTransformation,
+            )
+            left = (target_width - scaled.width()) // 2
+            top = (target_height - scaled.height()) // 2
+            self.board_draw_rect = (left, top, scaled.width(), scaled.height())
+            self.board_label.setPixmap(scaled)
 
         def make_seconds_spin(self, minimum, maximum):
             spin = QDoubleSpinBox()
@@ -1038,8 +2510,11 @@ def launch_gui():
             self.max_time_spin.setValue(
                 self.config_float(config, "auto_move_search_time_max", 5.0)
             )
+            self.auto_move_checkbox.setChecked(
+                self.config_bool(config, "auto_move", True)
+            )
             self.turn_indicator_checkbox.setChecked(
-                self.config_bool(config, "auto_turn_indicator", True)
+                self.config_bool(config, "online_use_avatar_turn_indicator", False)
             )
             self.auto_next_checkbox.setChecked(
                 self.config_bool(config, "auto_start_next_game", False)
@@ -1048,7 +2523,7 @@ def launch_gui():
                 self.config_bool(config, "next_game_fullscreen_scan", True)
             )
 
-        def save_settings(self):
+        def save_settings(self, silent=False):
             min_sec, max_sec = sorted((
                 self.min_time_spin.value(),
                 self.max_time_spin.value(),
@@ -1059,7 +2534,9 @@ def launch_gui():
                 update_config({
                     "auto_move_search_time_min": round(min_sec, 2),
                     "auto_move_search_time_max": round(max_sec, 2),
+                    "auto_move": self.auto_move_checkbox.isChecked(),
                     "auto_turn_indicator": self.turn_indicator_checkbox.isChecked(),
+                    "online_use_avatar_turn_indicator": self.turn_indicator_checkbox.isChecked(),
                     "auto_start_next_game": self.auto_next_checkbox.isChecked(),
                     "next_game_fullscreen_scan": self.active_next_scan_checkbox.isChecked(),
                 })
@@ -1068,8 +2545,9 @@ def launch_gui():
                 return
             if self.app_worker is not None:
                 self.app_worker.request_reload()
-                self.set_status("设置已保存，正在重新读取...")
-            else:
+                if not silent:
+                    self.set_status("设置已保存，正在重新读取...")
+            elif not silent:
                 self.set_status("设置已保存")
 
         def set_status(self, text):
@@ -1090,11 +2568,11 @@ def launch_gui():
                 return
             if not calibration_exists():
                 self.set_status("缺少 config.json，请先点击“校准棋盘”。")
-                self.start_button.setText("开始")
+                self.start_button.setText("开始监控(&S)")
                 self.start_button.setEnabled(True)
                 return
 
-            self.start_button.setText("停止")
+            self.start_button.setText("停止监控(&S)")
             self.set_status("正在启动...")
             self.worker_thread = threading.Thread(target=self.run_worker, daemon=True)
             self.worker_thread.start()
@@ -1109,7 +2587,14 @@ def launch_gui():
 
         def run_worker(self):
             try:
-                self.app_worker = App(exit_on_error=False, hide_dock_icon=False)
+                self.app_worker = App(
+                    exit_on_error=False,
+                    hide_dock_icon=False,
+                    board_callback=self.signals.board.emit,
+                    move_callback=self.signals.move.emit,
+                    fen_callback=self.signals.fen.emit,
+                    analysis_callback=self.signals.analysis.emit,
+                )
                 if self.closing:
                     self.app_worker.stop()
                     self.app_worker.eng.quit()
@@ -1128,6 +2613,70 @@ def launch_gui():
                 return
             self.app_worker.request_reload()
             self.set_status("正在重新读取...")
+
+        def check_engine_status(self):
+            self.set_status("正在检测引擎...")
+            threading.Thread(target=self.run_engine_check, daemon=True).start()
+
+        def run_engine_check(self):
+            engine = None
+            try:
+                engine = Engine()
+                if engine.process and engine.process.poll() is None:
+                    self.signals.status.emit("引擎正常，可以计算")
+                else:
+                    self.signals.status.emit("引擎没有正常运行")
+            except Exception as e:
+                self.signals.status.emit(f"引擎检测失败：{e}")
+            finally:
+                if engine is not None:
+                    engine.quit()
+
+        def calculate_now(self):
+            if self.calculate_thread and self.calculate_thread.is_alive():
+                self.set_status("已经在计算")
+                return
+            if not calibration_exists():
+                self.set_status("缺少 config.json，请先点击“校准棋盘”。")
+                return
+            if self.calculate_button is not None:
+                self.calculate_button.setEnabled(False)
+            self.current_move = ""
+            self.current_move_label = ""
+            self.update_board_display(self.current_grid)
+            self.set_status("正在计算当前棋盘...")
+            self.calculate_thread = threading.Thread(
+                target=self.run_single_calculation,
+                daemon=True,
+            )
+            self.calculate_thread.start()
+
+        def run_single_calculation(self):
+            app = None
+            try:
+                app = App(
+                    exit_on_error=False,
+                    hide_dock_icon=False,
+                    board_callback=self.signals.board.emit,
+                    move_callback=self.signals.move.emit,
+                    fen_callback=self.signals.fen.emit,
+                    analysis_callback=self.signals.analysis.emit,
+                    enable_mouse=False,
+                )
+                if self.closing:
+                    return
+                ok = app.calculate_current_board()
+                if not ok:
+                    self.signals.status.emit("没有识别到可计算的棋盘")
+            except Exception as e:
+                self.signals.status.emit(f"计算失败：{e}")
+            finally:
+                if app is not None:
+                    try:
+                        app.eng.quit()
+                    except Exception:
+                        pass
+                self.signals.calculation_done.emit()
 
         def calibrate_helper(self):
             if self.calibrate_thread and self.calibrate_thread.is_alive():
@@ -1232,9 +2781,13 @@ def launch_gui():
             self.recognize_next_button.setEnabled(True)
             self.load_settings()
 
+        def on_calculation_done(self):
+            if self.calculate_button is not None:
+                self.calculate_button.setEnabled(True)
+
         def on_stopped(self):
             self.start_button.setEnabled(True)
-            self.start_button.setText("开始")
+            self.start_button.setText("开始监控(&S)")
             if not self.status.text().startswith("错误："):
                 self.set_status("已停止")
 
@@ -1246,6 +2799,8 @@ def launch_gui():
                 self.worker_thread.join(timeout=2.0)
             if self.calibrate_thread is not None:
                 self.calibrate_thread.join(timeout=1.0)
+            if self.calculate_thread is not None:
+                self.calculate_thread.join(timeout=1.0)
             if self.recognize_thread is not None:
                 self.recognize_thread.join(timeout=1.0)
             event.accept()
