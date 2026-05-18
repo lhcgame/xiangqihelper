@@ -1707,12 +1707,15 @@ def launch_gui():
             self.set_status("已选择开局库")
 
         def find_opening_book_path(self):
-            return os.path.join(os.path.dirname(os.path.abspath(__file__)), "book.xqb")
+            for path in candidate_paths("book.xqb"):
+                if os.path.exists(path):
+                    return path
+            return None
 
         def load_opening_book_panel(self):
             if not self.opening_book_path:
                 self.side_panel_text.setPlainText(
-                    "没有找到开局库文件。\n\n请确认目录存在：\nC:\\Users\\Tom\\Desktop\\xqbook-main"
+                    "没有找到开局库文件。\n\n请把 book.xqb 放到程序文件夹，也就是 XiangqiHelper.exe 旁边。"
                 )
                 return
 
@@ -1855,10 +1858,15 @@ def launch_gui():
         def query_xqbook(self, fen):
             if not self.opening_book_path or not fen:
                 return []
-            key, mirror_ud, mirror_lr, rows, cols = self.xqbook_fen_to_key(fen)
-            uri = pathlib.Path(self.opening_book_path).as_uri() + "?mode=ro"
+            if not os.path.exists(self.opening_book_path):
+                return []
             results = []
-            conn = sqlite3.connect(uri, uri=True)
+            try:
+                key, mirror_ud, mirror_lr, rows, cols = self.xqbook_fen_to_key(fen)
+                uri = pathlib.Path(self.opening_book_path).as_uri() + "?mode=ro"
+                conn = sqlite3.connect(uri, uri=True)
+            except Exception:
+                return []
             try:
                 query = (
                     "select Id,Move,Score,Win,Draw,Lost,Valid,Memo "
