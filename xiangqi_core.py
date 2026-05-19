@@ -161,6 +161,29 @@ def chinese_step_number(side, steps):
     return numerals[max(0, min(8, steps - 1))]
 
 
+def chinese_piece_label(board, piece, side, src_row, src_col):
+    name = CHINESE_PIECE_NAMES.get(piece, piece)
+    same_file_rows = [
+        row
+        for row in range(10)
+        if board[row][src_col] == piece
+    ]
+    if len(same_file_rows) < 2:
+        return f"{name}{chinese_file_number(side, src_col)}"
+
+    front_to_back = sorted(same_file_rows, reverse=(side == "black"))
+    index = front_to_back.index(src_row)
+    if len(front_to_back) == 2:
+        prefix = "前" if index == 0 else "后"
+    elif len(front_to_back) == 3:
+        prefix = ("前", "中", "后")[index]
+    else:
+        middle_labels = RED_NUMERALS if side == "red" else BLACK_NUMERALS
+        labels = ["前"] + list(middle_labels[1:len(front_to_back) - 1]) + ["后"]
+        prefix = labels[index]
+    return f"{prefix}{name}"
+
+
 def move_to_chinese(board, move):
     src_row, src_col, dst_row, dst_col = uci_to_coords(move)
     piece = board[src_row][src_col]
@@ -168,20 +191,20 @@ def move_to_chinese(board, move):
         return normalize_uci(move)
 
     side = piece_side(piece)
-    name = CHINESE_PIECE_NAMES.get(piece, piece)
-    start_file = chinese_file_number(side, src_col)
+    label = chinese_piece_label(board, piece, side, src_row, src_col)
     forward = dst_row < src_row if side == "red" else dst_row > src_row
-    action = "平"
-    target = chinese_file_number(side, dst_col)
 
-    if dst_col != src_col:
-        action = "进" if forward else "退"
+    if dst_row == src_row:
+        action = "平"
         target = chinese_file_number(side, dst_col)
-    elif dst_row != src_row:
+    elif dst_col == src_col:
         action = "进" if forward else "退"
         target = chinese_step_number(side, abs(dst_row - src_row))
+    else:
+        action = "进" if forward else "退"
+        target = chinese_file_number(side, dst_col)
 
-    return f"{name}{start_file}{action}{target}"
+    return f"{label}{action}{target}"
 
 
 def move_line_to_chinese(board, moves):

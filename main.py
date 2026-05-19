@@ -541,7 +541,14 @@ class App:
 
     def _emit_record(self):
         if self.record_callback is not None:
-            self.record_callback(self._record_history_text())
+            self.record_callback(self._record_snapshot())
+
+    def _record_snapshot(self):
+        return {
+            "text": self._record_history_text(),
+            "start_fen": self.record_start_fen,
+            "moves": [dict(item) for item in self.record_moves],
+        }
 
     def _format_engine_analysis(self, fen=None, flipped=False):
         lines = []
@@ -1875,7 +1882,7 @@ def launch_gui():
         analysis = pyqtSignal(str)
         engine_score = pyqtSignal(str, int)
         history_score = pyqtSignal(int, int, int)
-        record = pyqtSignal(str)
+        record = pyqtSignal(object)
         local_move = pyqtSignal(str)
         ai_done = pyqtSignal()
         score_analysis_done = pyqtSignal(int, int, int)
@@ -4317,8 +4324,52 @@ def launch_gui():
             elif completed:
                 self.set_status(f"棋谱局势图分析已停止：{completed}/{total}")
 
-        def update_record_display(self, text):
-            self.online_record_text = text or ""
+        def update_link_record_history(self, snapshot):
+            moves = snapshot.get("moves") or []
+            start_fen = snapshot.get("start_fen") or (
+                moves[0].get("from_fen") if moves else START_FEN
+            )
+            fens = [start_fen]
+            history_moves = []
+            for item in moves:
+                move = item.get("move")
+                to_fen = item.get("to_fen")
+                if not move or not to_fen:
+                    continue
+                history_moves.append(move)
+                fens.append(to_fen)
+            if not fens:
+                return
+
+            old_fens = list(self.history_fens)
+            old_scores = list(getattr(self, "history_scores", []))
+            self.history_fens = fens
+            self.history_moves = history_moves
+            self.history_scores = []
+            for index, fen in enumerate(fens):
+                if index < len(old_fens) and old_fens[index] == fen and index < len(old_scores):
+                    self.history_scores.append(old_scores[index])
+                else:
+                    self.history_scores.append(0 if index == 0 else None)
+            self.history_index = len(self.history_fens) - 1
+            self.current_move = self.history_moves[-1] if self.history_moves else ""
+            try:
+                self.current_fen = self.history_fens[self.history_index]
+                self.game_board, self.game_side = fen_to_board(self.current_fen)
+                self.current_grid = [row[:] for row in self.game_board]
+                self.update_board_display(self.current_grid)
+            except Exception:
+                pass
+            self.refresh_navigation_buttons()
+            if len(self.history_fens) > len(old_fens):
+                self.start_score_chart_analysis(auto=True, start_index=max(1, len(old_fens)))
+
+        def update_record_display(self, payload):
+            if isinstance(payload, dict):
+                self.online_record_text = payload.get("text") or ""
+                self.update_link_record_history(payload)
+            else:
+                self.online_record_text = payload or ""
             if self.side_panel.isVisible() and self.side_panel_title.text() == "导航":
                 self.side_panel_text.setPlainText(self.navigation_text())
             self.refresh_right_workspace()
@@ -4770,7 +4821,7 @@ def launch_gui():
             self.save_settings(silent=True)
             self.update_link_mode_switches(True, True)
             self.set_status("正在启动...")
-            self.update_record_display("")
+            self.update_record_display({"text": "", "start_fen": START_FEN, "moves": []})
             self.worker_thread = threading.Thread(target=self.run_worker, daemon=True)
             self.worker_thread.start()
 
